@@ -436,6 +436,29 @@ def test_base_is_https():
     assert L.BASE.startswith("https://"), L.BASE
 
 
+def test_main_effective_date_not_from_version_xml():
+    """본칙 시행일은 부칙 제1조 본문에서 판정 — 시행본 XML <시행일자>로 판정하면 2024년에 시행된
+    제19563호(공포 후 1년)를 2027년 본칙으로 오표시했다 (2026-11-20 실서버)."""
+    C = L.LawGoKrClient
+    b = ("부칙 <법률 제19563호, 2023. 7. 18.>\n제1조(시행일) 이 법은 공포 후 1년이 경과한 날부터 "
+         "시행한다. 다만, 부칙 제2조제6항은 2025년 1월 1일부터 시행한다.\n제2조(다른 법률의 개정) …")
+    assert not C._main_effective_date(b, "20230718", "20270101")
+    assert C._main_effective_date(b, "20230718", "20240719")
+    b2 = "부칙\n제1조(시행일) 이 법은 2025년 1월 1일부터 시행한다. 다만, 다음 각 호 …\n2. 제37조: 2027년 1월 1일"
+    assert not C._main_effective_date(b2, "20241231", "20270101")
+    assert C._main_effective_date("제1조(시행일) 이 영은 공포한 날부터 시행한다.", "20260930", "20260930")
+
+
+def test_treaty_text_cr_only_newlines():
+    """law.go.kr 조약 본문은 줄바꿈이 \\r 단독 — 정규화하지 않으면 조 표제를 못 찾는다 (한·미 조약 실측)."""
+    C = L.LawGoKrClient
+    t = C._treaty_text("앞\r\r\r제10조 배당\r\r\t(1)\t내용\r\r\r제11조 이자\r\r(1) x")
+    spans = C._treaty_article_spans(t, "10", "ko")
+    assert len(spans) == 1 and t[spans[0][0]:spans[0][1]].strip().startswith("제10조 배당")
+    te = C._treaty_text("x\rArticle 10\rDividends\r(1) y\rArticle 11\rInterest")
+    assert len(C._treaty_article_spans(te, "10", "en")) == 1
+
+
 def _run_all():
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
