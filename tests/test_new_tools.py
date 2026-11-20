@@ -455,6 +455,11 @@ def test_treaty_text_cr_only_newlines():
     t = C._treaty_text("앞\r\r\r제10조 배당\r\r\t(1)\t내용\r\r\r제11조 이자\r\r(1) x")
     spans = C._treaty_article_spans(t, "10", "ko")
     assert len(spans) == 1 and t[spans[0][0]:spans[0][1]].strip().startswith("제10조 배당")
+    # 다른 조를 인용하며 시작하는 문단은 표제가 아니다 (한·미 조약 제10조 실측)
+    t2 = C._treaty_text("제10조 해운 및 항공운수\r\r\t제8조(사업소득)의 규정에 불구하고, 일방 체약국의 거주자가 "
+                        "국제운수에 선박 또는 항공기를 운행함으로써 얻는 소득은 면제된다.\r\r\r제11조 특수관계인\r(1) z")
+    s2 = C._treaty_article_spans(t2, "10", "ko")
+    assert len(s2) == 1 and "규정에 불구하고" in t2[s2[0][0]:s2[0][1]]
     te = C._treaty_text("x\rArticle 10\rDividends\r(1) y\rArticle 11\rInterest")
     assert len(C._treaty_article_spans(te, "10", "en")) == 1
 
