@@ -264,6 +264,71 @@ def test_later_addenda_refs_extracts_target_part():
     assert not L.LawGoKrClient._later_addenda_refs(units, "18578", "20270101", "20211208")
 
 
+# ---------------------------------------------------------------------------
+# 시행예정 — 다른 법률의 부칙이 '아직 시행 전인 개정법'을 고친 경우 (제19563호 실측)
+def _version_xml(promul_no, promul_date, arts):
+    """arts: [(조번호, 가지번호, 제목, 변경Y여부)] — 시행예정본 원문의 조문 부분만 흉내 낸다."""
+    units = "".join(
+        f"<조문단위><조문번호>{no}</조문번호>"
+        + (f"<조문가지번호>{br}</조문가지번호>" if br else "")
+        + f"<조문여부>조문</조문여부><조문제목><![CDATA[{t}]]></조문제목>"
+        f"<조문변경여부>{'Y' if ch else 'N'}</조문변경여부><조문내용><![CDATA[제{no}조]]></조문내용></조문단위>"
+        for no, br, t, ch in arts)
+    return (f"<?xml version=\"1.0\"?><법령><기본정보><공포일자>{promul_date}</공포일자>"
+            f"<공포번호>{promul_no}</공포번호><법령명_한글><![CDATA[소득세법]]></법령명_한글>"
+            f"<시행일자>20270101</시행일자></기본정보><조문>{units}</조문><부칙></부칙></법령>")
+
+
+def _run_upcoming(rows, versions):
+    def g(endpoint, **params):
+        if params.get("MST") in versions:
+            return versions[params["MST"]]
+        return _fixture_get(endpoint, **params)
+    base = {"법령명": "소득세법", "법령ID": "001565", "시행일자": "20270101"}
+    hist = [dict(base, **r) for r in rows] + [dict(base, MST="280405", 시행일자="20260701",
+                                                  공포일자="20251223", 공포번호="21221", 제개정구분="일부개정")]
+    with _patched_get(g) as c:
+        c.law_history = lambda *a, **k: hist
+        return c.law_upcoming("소득세법", law_id="001565", max_versions=5, today="20261120")
+
+
+def test_law_upcoming_follows_other_law_addendum_amending_pending_law():
+    r = _run_upcoming(
+        [dict(MST="252783", 공포일자="20230718", 공포번호="19563", 제개정구분="타법개정")],
+        {"252783": _version_xml("19563", "20230718", [
+            ("21", "", "기타소득", True), ("119", "", "비거주자의 국내원천소득", True)])})
+    v = next(v for v in r["시행예정"] if v["공포번호"] == "19563")
+    assert "법률 제17757호를 고침" in v["근거"], v
+    assert [a["조문"] for a in v["언급_조문"]] == ["제21조", "제119조"], v["언급_조문"]
+    assert any("제21조제1항제27호" in t for t in v["이날_시행되는_개정규정"]), v
+    assert any(x["부칙"] == "17757" for x in v["연결_근거"]), v["연결_근거"]
+    assert "연결_추정" not in v
+
+
+def test_law_upcoming_guess_only_links_to_earlier_pending_law():
+    """제18578호처럼 근거 문장이 없으면, 먼저 공포된 개정법의 그날 시행 항목과 겹치는
+    '개정 표시 조문'만 추정으로 보여준다 — 나중에 공포된 법(제21221호)의 항목과는 잇지 않는다."""
+    r = _run_upcoming(
+        [dict(MST="237497", 공포일자="20211208", 공포번호="18578", 제개정구분="일부개정")],
+        {"237497": _version_xml("18578", "20211208", [
+            ("37", "", "기타소득의 필요경비 계산", True), ("118", "17", "재전입 등에 따른 환급 등", True),
+            ("129", "", "원천징수세율", True)])})
+    v = next(v for v in r["시행예정"] if v["공포번호"] == "18578")
+    assert v["근거"].startswith("추정"), v
+    assert [a["조문"] for a in v["언급_조문"]] == ["제37조"], v["언급_조문"]
+    owners = {x["소속_공포번호"] for x in v["연결_추정"]}
+    assert owners == {"17757"}, v["연결_추정"]
+
+
+def test_amended_law_links_parses_other_law_part():
+    from test_parsers import read_gz
+    units = L.LawGoKrClient._parse_addenda_units(read_gz("law_280405.xml.gz"))
+    u = next(u for u in units if u["공포번호"] == "19563")
+    links = L.LawGoKrClient._amended_law_links(u["본문"], "소득세법")
+    assert links and links[0]["개정법"] == "17757" and links[0]["조문"] == ["제21조", "제119조"], links
+    assert not L.LawGoKrClient._amended_law_links(u["본문"], "법인세법")
+
+
 def _run_all():
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
