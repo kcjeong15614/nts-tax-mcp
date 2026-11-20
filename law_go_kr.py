@@ -1338,6 +1338,16 @@ class LawGoKrClient:
                 v["개정_조문"] = changed
                 if staged:
                     v["참고"] = "부칙 단서 호에 든 조문은 각 호의 날짜에 따로 시행되므로 제외함"
+                if not changed and later_refs:
+                    # 시행예정본 원문에 개정 표시가 없으면(시행령 제32516호 실측) 후속 부칙이 그날로
+                    # 정한 조문이라도 보여준다
+                    labels = []
+                    for ref in later_refs:
+                        labels += [lb for lb in self._labels(ref["대상"]) if lb not in labels]
+                    labels.sort(key=lambda lb: order.index(lb) if lb in order else len(order))
+                    v["언급_조문"] = [{"조문": lb, "조문제목": titles.get(lb, "")} for lb in labels]
+                    v["참고"] = ("시행예정본 원문에 개정 표시(<조문변경여부>Y)가 없어, 시행일_변경_근거의 "
+                                "후속 부칙이 그날 시행으로 정한 조문을 언급_조문으로 보여줌")
             else:
                 v["근거"] = "확인 불가"
                 v["안내"] = ("이 시행일은 이 공포본 부칙(공포 당시·현재 문안 모두)의 본칙 시행일도, 단서 각 호의 "

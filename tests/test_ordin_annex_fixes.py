@@ -391,7 +391,9 @@ def test_law_upcoming_sihaengryeong_notation():
         if mst == "290841":
             return _sihaeng_xml(_SIHAENG_ARTS, _SIHAENG_UNITS)
         if mst in old_units:
-            return _sihaeng_xml(arts_35947 if mst == "280865" else _SIHAENG_ARTS, old_units[mst])
+            arts = (arts_35947 if mst == "280865" else
+                    [(a, b, t, False) for a, b, t, _ in _SIHAENG_ARTS] if mst == "241175" else _SIHAENG_ARTS)
+            return _sihaeng_xml(arts, old_units[mst])
         raise AssertionError(params)
     with _patched_get(g) as c:
         c.law_history = lambda *a, **k: rows
@@ -401,6 +403,8 @@ def test_law_upcoming_sihaengryeong_notation():
     v = by[("32516", "20270101")]       # 현재 부칙의 본칙 시행일이 2027.1.1로 바뀜
     assert v["근거"].startswith("본칙 시행일") and "현재 부칙 문안" in v["근거"], v
     assert {x["공포번호"] for x in v.get("시행일_변경_근거", [])} == {"35349"}, v
+    assert v["개정_조문"] == [] and [a["조문"] for a in v["언급_조문"]] == [
+        "제88조", "제183조", "제207조", "제216조의4"], v
 
     for no in ("33207", "35121"):       # 제35349호 부칙 4호 괄호 안 '…에 따라 개정된 내용을 포함한다'
         v = by[(no, "20270101")]
