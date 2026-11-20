@@ -1026,6 +1026,22 @@ class LawGoKrClient:
                     out.append((d, t))
         return out
 
+    @classmethod
+    def _later_addenda_refs(cls, units, promul_no: str, target: str, promul_date: str):
+        """다른(이후) 공포본 부칙 제1조 단서 중 '법률 제{promul_no}호 …의 개정규정: {target}'처럼
+        이 공포본 조문의 시행일을 정한 호 → [{공포번호, 공포일자, 문장, 대상}]. '대상'은
+        '법률 제N호' 뒤쪽(그 공포본 조문 부분)만 잘라 둔 것이다."""
+        key = f"법률 제{promul_no}호"
+        refs = []
+        for u in units:
+            if u["공포번호"] == promul_no or (u.get("공포일자") or "") <= promul_date:
+                continue
+            for d, t in cls._staged_items(u["본문"]):
+                if d == target and key in t:
+                    refs.append({"공포번호": u["공포번호"], "공포일자": u.get("공포일자", ""),
+                                 "문장": t, "대상": t.split(key, 1)[1].split(":")[0]})
+        return refs
+
     def law_upcoming(self, law_name: str, law_id: str = "", max_versions: int = 5,
                      today: str = ""):
         """공포됐으나 아직 시행되지 않은 개정(시행예정 시행본)과, 시행일마다 어떤
@@ -1055,6 +1071,25 @@ class LawGoKrClient:
                 seen.add(k)
                 rows.append(r)
         xml_cache, versions = {}, []
+        # 시행예정본 XML의 부칙은 그 공포 당시 문안이다. 이후 법률이 부칙 시행일을 바꾸면
+        # 가장 최근 공포본 XML의 부칙에만 바뀐 문안(과 바꾼 법률의 부칙)이 있다
+        # (2026-11-20 실측: 제17757호 가상자산 과세 → 현재 부칙 2호 '2027년 1월 1일',
+        #  바꾼 법률 제20615호 부칙 제1조 2호).
+        latest = max(history, key=lambda r: (r.get("공포일자", ""),
+                                             int(r.get("공포번호") or 0)))
+        latest_units = None
+
+        def _latest_units():
+            nonlocal latest_units
+            if latest_units is None:
+                try:
+                    if latest["MST"] not in xml_cache:
+                        xml_cache[latest["MST"]] = _get("lawService.do", target="law", MST=latest["MST"])
+                    latest_units = self._parse_addenda_units(xml_cache[latest["MST"]])
+                except (LawGoKrError, requests.exceptions.RequestException):
+                    latest_units = []
+            return latest_units
+
         for r in rows[:max(1, max_versions)]:
             v = {k: r.get(k, "") for k in ("시행일자", "공포일자", "공포번호", "제개정구분", "MST")}
             try:
@@ -1085,6 +1120,22 @@ class LawGoKrClient:
                     if _korean_date_to_ymd(sent) == r["시행일자"] and re.search(r"제\d+조", sent):
                         todays.append(sent.strip())
                 basis = "부칙 제1조 단서 문장 (조문별 시행일)"
+            later_refs = []
+            if not todays and not is_main and want:
+                lu = _latest_units()
+                cur = next((u for u in lu if u["공포번호"] == want), None)
+                if cur is not None and cur["본문"] != (unit or {}).get("본문"):
+                    todays = [t for d, t in self._staged_items(cur["본문"]) if d == r["시행일자"]]
+                    if todays:
+                        basis = ("부칙 제1조 단서 각 호 — 이후 법률로 바뀐 현재 부칙 문안 "
+                                 f"(최신 공포본 제{latest.get('공포번호', '')}호 원문 기준)")
+                later_refs = self._later_addenda_refs(lu, want, r["시행일자"], r.get("공포일자") or "")
+                if not todays and later_refs:
+                    todays = [ref["대상"] for ref in later_refs]
+                    basis = "후속 법률 부칙이 이 공포본 조문의 시행일을 정함"
+            if later_refs:
+                v["시행일_변경_근거"] = [{k: ref[k] for k in ("공포번호", "공포일자", "문장")}
+                                     for ref in later_refs]
             if todays:
                 labels = []
                 order = [a["조문"] for a in arts]
@@ -1119,9 +1170,10 @@ class LawGoKrClient:
                     v["참고"] = "부칙 단서 호에 든 조문은 각 호의 날짜에 따로 시행되므로 제외함"
             else:
                 v["근거"] = "확인 불가"
-                v["안내"] = ("이 시행일은 이 공포본 부칙의 본칙 시행일도, 단서 각 호의 날짜도 아님 — "
-                            "대개 이후 법률이 이 공포본 일부 조문의 시행일을 연기·변경한 경우다. "
-                            "law_addenda_search(promul_no=공포번호)와 이후 개정 부칙을 함께 확인하세요")
+                v["안내"] = ("이 시행일은 이 공포본 부칙(공포 당시·현재 문안 모두)의 본칙 시행일도, 단서 각 호의 "
+                            "날짜도 아니고, 이후 법률 부칙에도 이 공포본을 그날로 정한 호가 없음. "
+                            "법제처 연혁의 시행일 표시만 있는 경우일 수 있으니 law_addenda_search"
+                            "(promul_no=공포번호)와 law_article_diff로 그날 실제로 바뀌는 조문을 확인하세요")
             versions.append(v)
         out["시행예정"] = versions
         if len(rows) > len(versions):

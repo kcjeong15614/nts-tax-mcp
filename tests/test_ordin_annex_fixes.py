@@ -212,6 +212,58 @@ def test_olta_detail_text_joins_inline_spans():
     assert "다운로드" not in text and "" not in lines
 
 
+# ---------------------------------------------------------------------------
+# 시행예정 — 이후 법률이 부칙 시행일을 바꾼 경우 (최신 공포본 부칙에서 근거를 찾는다)
+_OLD_17757 = """<?xml version="1.0" encoding="UTF-8"?><법령><기본정보><법령ID>001565</법령ID>
+<공포일자>20201229</공포일자><공포번호>17757</공포번호><법령명_한글><![CDATA[소득세법]]></법령명_한글>
+<시행일자>20210101</시행일자></기본정보>
+<조문><조문단위 조문키="0037001"><조문번호>37</조문번호><조문여부>조문</조문여부>
+<조문제목><![CDATA[기타소득의 필요경비 계산]]></조문제목><조문내용><![CDATA[제37조(기타소득의 필요경비 계산)]]></조문내용></조문단위>
+<조문단위 조문키="0164004"><조문번호>164</조문번호><조문가지번호>4</조문가지번호><조문여부>조문</조문여부>
+<조문제목><![CDATA[가상자산 거래내역 등의 제출]]></조문제목><조문내용><![CDATA[제164조의4(가상자산 거래내역 등의 제출)]]></조문내용></조문단위></조문>
+<부칙><부칙단위><부칙공포일자>20201229</부칙공포일자><부칙공포번호>17757</부칙공포번호>
+<부칙내용><![CDATA[부칙 〈제17757호,2020.12.29〉
+제1조(시행일) 이 법은 2021년 1월 1일부터 시행한다. 다만, 다음 각 호의 개정규정은 각 호의 구분에 따른 날부터 시행한다.
+  2. 제37조제1항제3호 및 제164조의4의 개정규정: 2022년 1월 1일
+제2조(일반적 적용례) 생략]]></부칙내용></부칙단위></부칙></법령>"""
+
+
+def _deferred_history():
+    base = {"법령명": "소득세법", "법령ID": "001565", "제개정구분": "일부개정"}
+    return [dict(base, MST="224801", 시행일자="20270101", 공포일자="20201229", 공포번호="17757"),
+            dict(base, MST="237497", 시행일자="20270101", 공포일자="20211208", 공포번호="18578"),
+            dict(base, MST="280405", 시행일자="20260701", 공포일자="20251223", 공포번호="21221")]
+
+
+def test_law_upcoming_follows_later_amended_addendum():
+    def g(endpoint, **params):
+        if params.get("MST") == "224801":
+            return _OLD_17757
+        if params.get("MST") == "237497":   # 18578 시행예정본 — 원문 부칙 그대로
+            return _OLD_17757.replace("17757", "18578").replace("2022년 1월 1일", "2025년 1월 1일")
+        return _fixture_get(endpoint, **params)
+    with _patched_get(g) as c:
+        c.law_history = lambda *a, **k: _deferred_history()
+        r = c.law_upcoming("소득세법", law_id="001565", max_versions=5, today="20261120")
+    v = next(v for v in r["시행예정"] if v["공포번호"] == "17757")
+    assert "현재 부칙 문안" in v["근거"], v
+    labels = [a["조문"] for a in v["언급_조문"]]
+    assert "제37조" in labels and "제164조의4" in labels, labels
+    refs = v.get("시행일_변경_근거") or []
+    assert any(x["공포번호"] == "20615" and "2027년 1월 1일" in x["문장"] for x in refs), refs
+    v2 = next(v for v in r["시행예정"] if v["공포번호"] == "18578")
+    assert v2["근거"] == "확인 불가" and "연혁" in v2["안내"], v2
+
+
+def test_later_addenda_refs_extracts_target_part():
+    from test_parsers import read_gz
+    units = L.LawGoKrClient._parse_addenda_units(read_gz("law_280405.xml.gz"))
+    refs = L.LawGoKrClient._later_addenda_refs(units, "17757", "20270101", "20201229")
+    hit = next(x for x in refs if x["공포번호"] == "20615")
+    assert hit["대상"].strip().startswith("소득세법 일부개정법률 제37조제1항제3호"), hit
+    assert not L.LawGoKrClient._later_addenda_refs(units, "18578", "20270101", "20211208")
+
+
 def _run_all():
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

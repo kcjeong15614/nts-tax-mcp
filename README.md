@@ -7,8 +7,8 @@ Claude 채팅에서 바로 조회하고, 인용한 문서번호의 실존 여부
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![MCP](https://img.shields.io/badge/MCP-streamable--http-black)
-![tools](https://img.shields.io/badge/tools-18-brightgreen)
-![status](https://img.shields.io/badge/version-v5.4-informational)
+![tools](https://img.shields.io/badge/tools-21-brightgreen)
+![status](https://img.shields.io/badge/version-v5.6.1-informational)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 ```bash
@@ -249,7 +249,7 @@ nts-tax-mcp/
 │   └── README.md
 ├── requirements.txt
 ├── LICENSE                      # MIT
-├── CHANGELOG.md                 # 버전별 변경 이력 (v2 ~ v5.4)
+├── CHANGELOG.md                 # 버전별 변경 이력 (v2 ~ v5.6.1)
 ├── DATA_SOURCES.md              # 자료원 사양·코드표 (세목/카테고리 코드 등)
 ├── Procfile                     # Railway 배포용 (레거시 — 현재 운영은 서버컴퓨터+Tailscale Funnel)
 ├── setup.ps1                    # 서버컴퓨터 최초 설치 스크립트 (소스 다운로드→의존성→작업 스케줄러 등록)
@@ -435,6 +435,9 @@ nts-tax-mcp/
 | `recent` | 목록 모드 반환 건수 (기본 10, 최신순) |
 | `max_chars` | 본문 최대 길이 (기본 8000). 잘리면 응답에 `"잘림"` 안내 포함 |
 
+응답 머리의 `본칙_시행일자`는 그 시행본 원문 기본정보의 날짜(= 그 공포본 부칙의 본칙
+시행일)입니다. 연혁 목록의 `시행일자`(그 MST가 마지막으로 바뀐 날)와 다를 수 있습니다.
+
 `promul_no`·`article_no`를 모두 생략하면 목록 모드: 부칙 최신순 `recent`건의
 공포일자·공포번호·시행일 요약("다만, 다음 각 호…" 단서의 호별 시행일 포함)을 반환합니다.
 조문별 시행일이 다른 개정이면 `조문별_상이한_시행일` 항목이 함께 옵니다.
@@ -443,7 +446,7 @@ nts-tax-mcp/
 
 | 파라미터 | 설명 |
 |---|---|
-| `keyword` | 검색어 (예: "법인세법 기본통칙", "조사사무처리규정", "외국환거래규정") |
+| `keyword` | 검색어 (예: "조사사무처리규정", "외국환거래규정"). 국세청 기본통칙·집행기준은 법제처 DB에 없으므로 `nts_ruling_search`로 찾는다 |
 | `serial` | 일련번호 — 지정하면 본문 반환 |
 | `display` | 결과 수 (기본 10) |
 | `article` | 조번호 — `"9-5"`(제9-5조), `"23"`, `"23의2"` 형식. 해당 조문만 잘라 반환. 대형 고시(외국환거래규정 등)는 사실상 필수 |
@@ -463,9 +466,10 @@ nts-tax-mcp/
 | 파라미터 | 설명 |
 |---|---|
 | `keyword` | 검색어 (예: "취득세 감면") |
-| `region` | 지자체명 필터 (예: "서울", "용산구") |
-| `serial` | 일련번호 — 지정하면 본문 반환 |
+| `region` | 지자체명 필터 (예: "부산", "용산구") — 결과를 최대 500건까지 넘겨 보며 거르므로 `display`가 작아도 된다 |
+| `serial` | 검색 결과의 `일련번호` — 지정하면 조문·부칙 본문 반환 (v5.6.1부터 정확한 조례가 옴) |
 | `display` | 결과 수 (기본 20) |
+| `max_chars` / `start_char` | 본문 길이·이어 읽기 오프셋 (v5.6.1) |
 
 ### `law_article_search` (조문 키워드 검색, v5.6, `server_ext.py`)
 
@@ -490,6 +494,11 @@ nts-tax-mcp/
 (`제118조의9부터 제118조의18까지` 같은 범위는 원문 순서로 펼침), 본칙 시행일이면 그
 공포본에서 `<조문변경여부>Y`로 표시된 조문을 보여준다. 공포 전 개정안은 대상이 아니다.
 
+이후 법률이 부칙 시행일을 연기·변경한 경우(예: 제17757호 가상자산 과세 → 2027-01-01)는
+시행예정본 원문에 옛 날짜만 있으므로, 최신 공포본 원문의 **현재 부칙 문안**과
+**그 날짜를 정한 후속 법률 부칙**(`시행일_변경_근거`, 예: 제20615호 부칙 제1조 2호)을
+찾아 보여준다 (v5.6.1). 둘 다 없으면 `근거: 확인 불가`.
+
 ### `law_annex_search` (별표·서식, v5.6, `server_ext.py`)
 
 | 파라미터 | 설명 |
@@ -502,11 +511,15 @@ nts-tax-mcp/
 | `search_scope` | 횡단 검색 범위: "title"(별표명, 기본) / "law"(법령명) / "body"(본문) |
 | `max_chars` | 본문 최대 길이 (기본 8000) |
 
+목록의 `최종개정`은 별표 본문 머리의 `<개정 …>`·`<신설 …>` 표기입니다. law.go.kr 원문에는
+별표별 시행일 필드가 없으므로(가이드의 `별표시행일자`는 실제 응답에 없음), 시행 시점은
+그 개정의 부칙(`law_addenda_search`)으로 확인합니다 (v5.6.1).
+
 ### `treaty_search` 추가 파라미터 (v5.6)
 
 | 파라미터 | 설명 |
 |---|---|
-| `article` | 조번호 ("10", "10의2") — 그 조만 반환 |
+| `article` | 조번호 ("10", "10의2") — 그 조만 반환. **조번호는 조약마다 다르다** (한·미 조약은 배당 12조·이자 13조·사용료 14조) — 먼저 목차나 응답의 조 표제를 확인 |
 | `lang` | "ko"(국문, 기본) / "en"(영문 정본) |
 | `start_char` | 조번호 없이 이어 읽기 오프셋 |
 | `occurrence` | 같은 조번호가 의정서 등에 다시 나올 때 몇 번째 것인지 |
