@@ -89,6 +89,31 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 
+# Law MCP(lawApi.ts)와 같게 Referer·Origin을 채운다 — 같은 OC·같은 서버 IP에서 Law MCP만 정상이고
+# Tax MCP는 "필수입력요소 검증에 실패"가 났는데, 진단상 OC·요청주소·리다이렉트는 모두 정상이었다
+# (2026-11-20). 남은 차이가 이 헤더와 type(JSON/XML)뿐이었다.
+_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": "application/xml, text/xml, */*",
+    "Referer": "https://www.law.go.kr/",
+    "Origin": "https://www.law.go.kr",
+}
+
+
+def _probe_json(endpoint: str, ordered) -> str:
+    """XML 요청이 거부됐을 때 같은 요청을 type=JSON으로 한 번 보내 결과만 진단에 적는다."""
+    try:
+        alt = [(k, "JSON" if k == "type" else v) for k, v in ordered]
+        r = requests.get(f"{BASE}/{endpoint}", params=alt, timeout=TIMEOUT,
+                         headers={**_HEADERS, "Accept": "application/json, */*"})
+        t = r.text.lstrip()
+        ok = t.startswith("{") and "검증에 실패" not in t[:500]
+        msg = re.sub(r"\s+", " ", _strip_tags(t))[:120]
+        return "성공(JSON은 허용됨)" if ok else f"실패: {msg}"
+    except Exception as e:
+        return f"확인 불가({type(e).__name__})"
+
+
 def _mask_oc(url: str) -> str:
     return re.sub(r"(OC=)([^&]*)", lambda m: m.group(1) + (m.group(2)[:3] + "***" if m.group(2) else "(비어 있음)"), url)
 
@@ -150,13 +175,16 @@ def _get(endpoint: str, **params) -> str:
     head = [k for k in ("OC", "target", "type") if k in p]
     ordered = [(k, p[k]) for k in head] + [(k, v) for k, v in p.items() if k not in head]
     r = requests.get(f"{BASE}/{endpoint}", params=ordered, timeout=TIMEOUT,
-                     headers={"User-Agent": _UA, "Accept": "application/xml, text/xml, */*"})
+                     headers=_HEADERS)
     r.raise_for_status()
     text = r.text
     if "인증" in text[:500] and "실패" in text[:500]:
         raise LawGoKrAuthError("law.go.kr 인증 실패 — OC 또는 IP 등록 확인 필요 (open.law.go.kr에서 현재 서버 IP 등록) "
                                f"[진단] {_diag(r)}")
-    _check_response(endpoint, text, _diag(r))
+    try:
+        _check_response(endpoint, text, _diag(r))
+    except LawGoKrAuthError as e:
+        raise LawGoKrAuthError(f"{e} | 헤더=Referer·Origin 포함 | JSON재시도={_probe_json(endpoint, ordered)}") from None
     if len(_cache) >= _CACHE_MAX:
         del _cache[min(_cache, key=lambda k: _cache[k][0])]
     _cache[key] = (now + _CACHE_TTL, text)
