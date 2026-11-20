@@ -15,8 +15,11 @@ import html
 import time
 import requests
 
-BASE = "http://www.law.go.kr/DRF"
-OC = os.environ.get("LAW_API_OC", "")
+# https로 호출한다 — 같은 OC·같은 서버 IP에서 https+JSON을 쓰는 Law MCP는 정상인데
+# http 호출만 결과 0건이 나는 사례가 있었다 (2026-11-20, Render). 공식 가이드 URL도 https.
+BASE = os.environ.get("LAW_API_BASE", "https://www.law.go.kr/DRF")
+# 환경변수에 붙여넣을 때 앞뒤 공백·줄바꿈·따옴표가 섞이면 인증이 조용히 실패한다
+OC = os.environ.get("LAW_API_OC", "").strip().strip('"').strip("'").strip()
 TIMEOUT = 20
 
 # 같은 법령의 조문을 연속 조회하면 매번 법 전체 XML(소득세법 61만 자 등)을
@@ -78,6 +81,25 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s)
 
 
+def _check_response(endpoint: str, text: str) -> None:
+    """정상 결과가 아닌 응답(미신청·검증 실패 안내문, HTML 오류 페이지 등)을 걸러낸다.
+    이걸 놓치면 파서가 항목 0건으로 읽어 NOT_FOUND(부존재)로 보고하는 사고가 난다.
+    - 목록(lawSearch.do) 정상 응답에는 0건이어도 <totalCnt>가 반드시 있다
+    - 본문(lawService.do) 정상 응답은 XML이며 HTML 페이지가 아니다
+    캐시에 넣기 전에 호출해 잘못된 응답이 10분간 재사용되지 않게 한다."""
+    head = text.lstrip("﻿ \t\r\n")
+    snippet = re.sub(r"\s+", " ", _strip_tags(head))[:300]
+    looks_html = head[:200].lower().startswith(("<!doctype", "<html"))
+    if endpoint == "lawSearch.do" and "<totalCnt>" not in text:
+        raise LawGoKrAuthError(
+            f"law.go.kr가 검색 결과 대신 다른 응답을 돌려줌 — OC 값·IP/도메인 등록을 확인하세요. "
+            f"응답 내용: {snippet or '(빈 응답)'}")
+    if endpoint == "lawService.do" and (not head.startswith("<") or looks_html):
+        raise LawGoKrAuthError(
+            f"law.go.kr가 본문 대신 다른 응답을 돌려줌 — OC 값·IP/도메인 등록을 확인하세요. "
+            f"응답 내용: {snippet or '(빈 응답)'}")
+
+
 def _get(endpoint: str, **params) -> str:
     if not OC:
         raise LawGoKrAuthError("LAW_API_OC 환경변수가 설정되지 않았습니다 — law.go.kr에서 발급받은 기관코드(OC)를 설정하세요.")
@@ -94,6 +116,7 @@ def _get(endpoint: str, **params) -> str:
     text = r.text
     if "인증" in text[:500] and "실패" in text[:500]:
         raise LawGoKrAuthError("law.go.kr 인증 실패 — OC 또는 IP 등록 확인 필요 (open.law.go.kr에서 현재 서버 IP 등록)")
+    _check_response(endpoint, text)
     if len(_cache) >= _CACHE_MAX:
         del _cache[min(_cache, key=lambda k: _cache[k][0])]
     _cache[key] = (now + _CACHE_TTL, text)
