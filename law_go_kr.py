@@ -661,7 +661,12 @@ class LawGoKrClient:
         else:
             head = r"(?m)^[ \t]*제[ \t]*(\d+)[ \t]*조(?:[ \t]*의[ \t]*(\d+))?(?=[ \t(\n]|$)"
             want = (num, branch)
-        heads = list(re.finditer(head, body))
+        # 표제는 짧은 한 줄이다. "제8조(사업소득)의 규정에 불구하고, …"처럼 다른 조를 인용하며
+        # 시작하는 본문 문단을 표제로 잡으면 앞 조가 표제 한 줄만 남고 잘린다 (한·미 조약 제10조 실측).
+        def _line_len(m):
+            e = body.find("\n", m.start())
+            return len(body[m.start(): e if e != -1 else len(body)].strip())
+        heads = [m for m in re.finditer(head, body) if _line_len(m) <= 40]
         spans = []
         for i, m in enumerate(heads):
             key = m.group(1) if lang == "en" else (m.group(1), m.group(2))
