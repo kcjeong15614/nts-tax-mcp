@@ -360,6 +360,55 @@ def test_annex_tool_requires_input():
     assert server_ext.treaty_search()["status"] == "INVALID_INPUT"
 
 
+def test_check_response_flags_non_result_pages():
+    """정상 결과가 아닌 응답을 0건(NOT_FOUND)으로 오인하지 않아야 한다."""
+    bad = [
+        ("lawSearch.do", "사용자 정보 검증에 실패하였습니다. OPEN API 신청 정보를 확인하세요."),
+        ("lawSearch.do", "<html><body>미신청된 목록/본문에 대한 접근입니다.</body></html>"),
+        ("lawSearch.do", ""),
+        ("lawService.do", "<!DOCTYPE html><html><body>오류</body></html>"),
+        ("lawService.do", "등록되지 않은 IP입니다"),
+    ]
+    for ep, text in bad:
+        try:
+            L._check_response(ep, text)
+            raise AssertionError(f"걸러야 함: {ep} {text[:30]}")
+        except L.LawGoKrAuthError as e:
+            assert "응답 내용" in str(e)
+    # 정상 응답(0건 포함)은 통과
+    L._check_response("lawSearch.do", "<LawSearch><totalCnt>0</totalCnt></LawSearch>")
+    L._check_response("lawSearch.do", read_gz("law_eflaw_p1.xml.gz"))
+    L._check_response("lawService.do", read_gz("law_280405.xml.gz"))
+    L._check_response("lawService.do", "﻿<?xml version='1.0'?><조약></조약>")
+
+
+def test_get_reports_auth_error_through_safe():
+    """_get 경로 전체: 안내문 응답 → AUTH_ERROR(응답 문구 포함), 캐시에 남지 않음."""
+    import server_ext
+
+    class R:
+        status_code = 200
+        text = "사용자 정보 검증에 실패하였습니다."
+
+        def raise_for_status(self):
+            pass
+    orig_get, orig_oc = L.requests.get, L.OC
+    L.requests.get = lambda *a, **k: R()
+    L.OC = "test"
+    L._cache.clear()
+    try:
+        out = server_ext._safe(L.LawGoKrClient().search_laws, "소득세법")
+    finally:
+        L.requests.get, L.OC = orig_get, orig_oc
+    assert out["status"] == "AUTH_ERROR", out
+    assert "검증에 실패" in out["오류"], out
+    assert not L._cache, "잘못된 응답이 캐시되면 안 됨"
+
+
+def test_base_is_https():
+    assert L.BASE.startswith("https://"), L.BASE
+
+
 def _run_all():
     fns = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
