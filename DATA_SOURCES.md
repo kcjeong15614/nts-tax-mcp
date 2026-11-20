@@ -262,7 +262,7 @@ NTS/OLTA의 법원판례와 **별도 DB**라 문서번호 체계도 다르고 �
 
 ---
 
-## 5. MCP 서버 노출 도구 요약 (현재 v5.5, `server_ext.py` 기준 18개)
+## 5. MCP 서버 노출 도구 요약 (현재 v5.6, `server_ext.py` 기준 21개)
 
 ### 기본 8개 (`server.py`)
 
@@ -284,7 +284,7 @@ NTS/OLTA의 법원판례와 **별도 DB**라 문서번호 체계도 다르고 �
 "재산세제과73"이 "…재산세제과732"에 걸리는 숫자 경계 문제. `nts_ruling_get_by_doc_no`도
 같은 정규화 기준으로 비교한다(v5.4 — 이전에는 원문 완전일치라 표기 변형이 부존재로 나갔음).
 
-### 확장 10개 (`server_ext.py`에서만, law.go.kr)
+### 확장 13개 (`server_ext.py`에서만, law.go.kr)
 
 | 도구 | target | 주요 파라미터 |
 |---|---|---|
@@ -296,8 +296,11 @@ NTS/OLTA의 법원판례와 **별도 DB**라 문서번호 체계도 다르고 �
 | `law_article_diff` | eflaw→law | law_name, article_no, date_from, date_to, law_id, max_chars, find_change (v5.4) |
 | `law_addenda_search` | law (부칙 섹션) | law_name/mst, law_id, as_of_date, promul_no, article_no, recent, max_chars |
 | `admin_rule_search` | admrul | keyword, serial, display |
-| `treaty_search` | trty | keyword, serial, display |
+| `treaty_search` | trty | keyword, serial, display, article, lang(chrClsCd), start_char, occurrence (v5.6) |
 | `ordinance_search` | ordin | keyword, region(클라단 필터), serial, display |
+| `law_article_search` | eflaw→law (조문단위) | law_name, keyword, law_id, as_of_date, mst, max_results (v5.6) |
+| `law_upcoming_changes` | eflaw(미래 시행일자)→law (부칙 제1조·조문변경여부) | law_name, law_id, max_versions (v5.6) |
+| `law_annex_search` | law (별표단위) / licbyl | law_name/mst, annex_no, keyword, kind, as_of_date, search_scope, max_chars (v5.6) |
 
 전체 파라미터 설명은 `README.md`의 "도구 파라미터 참고" 참고.
 

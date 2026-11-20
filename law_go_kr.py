@@ -40,6 +40,35 @@ class LawGoKrNotFound(LawGoKrError):
     """검색·조회는 성공했으나 해당 자료가 원천에 없음"""
 
 
+class LawGoKrParseError(LawGoKrError):
+    """응답은 받았으나 예상한 XML 구조가 아님 (원천 개편 가능성) — 자료 부존재와 무관"""
+
+
+# 별표·서식 파일 링크는 상대경로("/LSW/flDownload.do?flSeq=…")로 온다 —
+# 이 호스트를 앞에 붙여야 HWP·PDF 원본을 받을 수 있다 (open.law.go.kr 활용방법 안내)
+FILE_HOST = "https://www.law.go.kr"
+
+
+def _abs_link(path: str) -> str:
+    path = (path or "").strip()
+    if not path:
+        return ""
+    return path if path.startswith("http") else FILE_HOST + (path if path.startswith("/") else "/" + path)
+
+
+def _korean_date_to_ymd(text: str) -> str:
+    """'2027년 1월 1일' → '20270101'. 못 찾으면 빈 문자열."""
+    m = re.search(r"(\d{4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text or "")
+    if not m:
+        return ""
+    return f"{m.group(1)}{int(m.group(2)):02d}{int(m.group(3)):02d}"
+
+
+def _article_label(base: str, branch: str = "") -> str:
+    branch = (branch or "").lstrip("0")
+    return f"제{base}조" + (f"의{branch}" if branch else "")
+
+
 def _strip_cdata(s: str) -> str:
     s = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", s, flags=re.S)
     return html.unescape(s).strip()
@@ -498,24 +527,112 @@ class LawGoKrClient:
         items = _parse_items(xml, "Trty") + _parse_items(xml, "trty")
         return [{
             "조약일련번호": it.get("조약일련번호", ""),
-            "조약명": it.get("조약명한글", it.get("조약명", "")),
+            "조약명": it.get("조약명한글", it.get("조약명_한글", it.get("조약명", ""))),
             "조약구분": it.get("조약구분명", ""),
             "서명일자": it.get("서명일자", ""),
             "발효일자": it.get("발효일자", ""),
         } for it in items]
 
-    def get_treaty(self, serial: str, max_chars: int = 12000):
-        """target=trty 조약 본문."""
-        xml = _get("lawService.do", target="trty", ID=serial)
-        name = re.search(r"<조약명한글>(.*?)</조약명한글>", xml, re.S)
-        body = _strip_tags(_strip_cdata(xml))
+    # 조약 본문 조회 API(trtyInfoGuide) 출력 필드: 조약명_한글·조약명_영문·발효일자·서명일자·
+    # 체결대상국가한글·조약내용 등. 국문/영문 본문은 별도 필드가 아니라 요청변수 chrClsCd로
+    # 고른다(010202 한글 기본, 010203 영문). 예전 코드는 '조약명한글'(밑줄 없음)을 찾아
+    # 조약명이 늘 비었고, 메타데이터까지 섞인 XML 전체를 본문으로 돌려줬다.
+    _TREATY_LANG = {"ko": "010202", "en": "010203"}
+    _TREATY_META = ("조약명_한글", "조약명_영문", "조약번호", "서명일자", "발효일자",
+                    "체결대상국가한글", "양자조약분야명")
+
+    @staticmethod
+    def _treaty_text(raw: str) -> str:
+        """<조약내용>을 줄 구조를 살려 텍스트로 — 조 표제를 행 첫머리에서 찾기 위해
+        <p>·<br>·</div>를 줄바꿈으로 바꾼 뒤 태그를 지운다."""
+        t = _strip_cdata(raw)
+        t = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", t)
+        t = _strip_tags(t)
+        t = html.unescape(t)
+        t = re.sub(r"[ \t ]+\n", "\n", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
+    @staticmethod
+    def _treaty_article_spans(body: str, article: str, lang: str):
+        """조 표제 위치 목록 [(시작, 끝)]. 같은 조번호가 의정서 등에서 다시 나오면 여러 개."""
+        a = article.strip()
+        am = re.match(r"^(\d+)(?:의(\d+))?$", a)
+        if not am:
+            raise LawGoKrError(f"article 형식 오류: '{a}' (예: '10', '10의2')")
+        num, branch = am.group(1), am.group(2)
+        if lang == "en":
+            head = r"(?im)^[ \t]*Article[ \t]+(\d+)(?:[ \t]*(?:bis|ter))?\b"
+            want = num
+        else:
+            head = r"(?m)^[ \t]*제[ \t]*(\d+)[ \t]*조(?:[ \t]*의[ \t]*(\d+))?(?=[ \t(\n]|$)"
+            want = (num, branch)
+        heads = list(re.finditer(head, body))
+        spans = []
+        for i, m in enumerate(heads):
+            key = m.group(1) if lang == "en" else (m.group(1), m.group(2))
+            if key != want:
+                continue
+            end = heads[i + 1].start() if i + 1 < len(heads) else len(body)
+            spans.append((m.start(), end))
+        return spans
+
+    def get_treaty(self, serial: str, max_chars: int = 12000, article: str = "",
+                   lang: str = "ko", start_char: int = 0, occurrence: int = 1):
+        """target=trty 조약 본문.
+
+        article: 조번호('10', '10의2')를 주면 그 조만 잘라 반환 — 조세조약은 수만 자라
+            전문을 max_chars에 담을 수 없으므로 배당(10조)·이자(11조)·사용료(12조)·
+            고정사업장(5조)처럼 조 단위로 읽는 것을 권장.
+        lang: 'ko'(국문, 기본) | 'en'(영문 정본 — 해석이 갈릴 때 대조용)
+        start_char: 조번호 없이 이어 읽을 때의 시작 오프셋
+        occurrence: 같은 조번호가 의정서 등에서 다시 나올 때 몇 번째 것을 볼지 (1부터)
+        """
+        lang = (lang or "ko").lower()
+        if lang not in self._TREATY_LANG:
+            raise LawGoKrError(f"lang은 'ko' 또는 'en'이어야 합니다: '{lang}'")
+        xml = _get("lawService.do", target="trty", ID=serial, chrClsCd=self._TREATY_LANG[lang])
+        meta = {}
+        for tag in self._TREATY_META:
+            m = re.search(rf"<{tag}>(.*?)</{tag}>", xml, re.S)
+            if m and _strip_cdata(m.group(1)):
+                meta[tag] = _strip_tags(_strip_cdata(m.group(1)))
+        cm = re.search(r"<조약내용>(.*?)</조약내용>", xml, re.S)
+        if cm:
+            body = self._treaty_text(cm.group(1))
+        else:  # 필드명이 달라진 경우 대비 — 예전 동작(전체 텍스트)으로 폴백
+            body = _strip_tags(_strip_cdata(xml))
+            meta["주의"] = "<조약내용> 필드를 찾지 못해 응답 전체 텍스트를 본문으로 반환함"
         if len(body) < 50:
-            return {"오류": "본문 없음", "응답": xml[:200]}
-        return {
-            "조약명": _strip_cdata(name.group(1)) if name else "",
-            "본문": body[:max_chars],
-            "본문길이": len(body),
-        }
+            raise LawGoKrNotFound(f"조약 본문 없음 (일련번호 {serial}, lang={lang}) — 응답 앞부분: {xml[:200]}")
+        out = {"조약명": meta.pop("조약명_한글", ""), **meta, "언어": lang, "본문길이": len(body)}
+
+        if article:
+            spans = self._treaty_article_spans(body, article, lang)
+            if not spans:
+                out["오류"] = (f"제{article}조 표제를 찾지 못함 — 표제 표기가 다를 수 있음. "
+                             f"start_char로 이어 읽거나 lang을 바꿔 시도")
+                return out
+            idx = max(1, int(occurrence or 1))
+            if idx > len(spans):
+                raise LawGoKrError(f"제{article}조는 {len(spans)}번만 나옵니다 (occurrence={idx})")
+            s, e = spans[idx - 1]
+            seg = body[s:e].strip()
+            out["조"] = article
+            out["본문"] = seg[:max_chars]
+            if len(spans) > 1:
+                out["안내"] = (f"같은 조번호가 본문에 {len(spans)}번 나옵니다(본 협약·의정서 등). "
+                             f"지금은 {idx}번째 — occurrence로 다른 것을 볼 수 있음")
+            if len(seg) > max_chars:
+                out["잘림"] = f"이 조 전체 {len(seg)}자 중 앞 {max_chars}자만 표시 — max_chars를 늘려 재조회"
+            return out
+
+        window = body[start_char:start_char + max_chars]
+        out["본문"] = window
+        if start_char + len(window) < len(body):
+            out["잘림"] = (f"전체 {len(body)}자 중 {start_char}~{start_char + len(window)}자 구간만 표시 — "
+                         f"start_char={start_char + len(window)}로 이어 읽거나 article에 조번호를 지정")
+        return out
 
     # ---------- 자치법규 (조례·규칙) ----------
     def search_ordinances(self, keyword: str, region: str = "", display: int = 20, page: int = 1):
@@ -548,6 +665,379 @@ class LawGoKrClient:
             "자치법규명": _strip_cdata(name.group(1)) if name else "",
             "본문": body[:max_chars],
             "본문길이": len(body),
+        }
+
+    # ---------- 공통: 시행본 선택 · 조문 목록 ----------
+    def _resolve_version(self, law_name: str = "", law_id: str = "", as_of_date: str = "",
+                         mst: str = ""):
+        """조회할 시행본 MST를 고른다. 반환 (mst, 메타 dict).
+        mst 직접 지정 > as_of_date 당시 시행본 > 현행본(법령명 정확 일치 우선)."""
+        if as_of_date and not re.match(r"^\d{8}$", str(as_of_date)):
+            raise LawGoKrError(f"as_of_date 형식 오류: '{as_of_date}' (YYYYMMDD 8자리)")
+        if mst:
+            return str(mst), {"MST": str(mst)}
+        if not law_name:
+            raise LawGoKrError("law_name 또는 mst 중 하나는 필요합니다")
+        if as_of_date:
+            chosen = None
+            for row in self.law_history(law_name, law_id=law_id):  # 시행일자 오름차순
+                if row["시행일자"] and row["시행일자"] <= as_of_date:
+                    chosen = row
+            if not chosen:
+                raise LawGoKrNotFound(f"{as_of_date} 이전 시행본 없음: {law_name}")
+        else:
+            rows = self.search_laws(law_name)
+            if law_id:
+                rows = [r for r in rows if r.get("법령ID") == law_id]
+            exact = [r for r in rows if r.get("법령명") == law_name.strip()]
+            pick = exact or rows  # "소득세법" 검색에 시행령·시행규칙이 섞여 나와 정확 일치 우선
+            if not pick:
+                raise LawGoKrNotFound(f"법령 검색 결과 없음: {law_name}")
+            chosen = pick[0]
+        meta = {k: chosen.get(k, "") for k in ("법령명", "시행일자", "공포일자", "공포번호", "MST")}
+        return chosen["MST"], meta
+
+    @staticmethod
+    def _iter_articles(xml: str):
+        """법령 원문 XML의 실제 조문(<조문여부>조문)만 순서대로.
+        장·절 표제(<조문여부>전문)와 부칙은 제외한다."""
+        cut = xml.find("<부칙>")
+        if cut != -1:
+            xml = xml[:cut]
+        out = []
+        for m in re.finditer(r"<조문단위[^>]*>(.*?)</조문단위>", xml, re.S):
+            blk = m.group(1)
+            kind = re.search(r"<조문여부>(.*?)</조문여부>", blk)
+            if kind and _strip_cdata(kind.group(1)) != "조문":
+                continue
+            no = re.search(r"<조문번호>(\d+)</조문번호>", blk)
+            if not no:
+                continue
+            br = re.search(r"<조문가지번호>(\d+)</조문가지번호>", blk)
+            title = re.search(r"<조문제목>(.*?)</조문제목>", blk, re.S)
+            ed = re.search(r"<조문시행일자>(\d+)</조문시행일자>", blk)
+            ch = re.search(r"<조문변경여부>(\w)</조문변경여부>", blk)
+            out.append({
+                "조문": _article_label(no.group(1), br.group(1) if br else ""),
+                "조문제목": _strip_cdata(title.group(1)) if title else "",
+                "조문시행일자": ed.group(1) if ed else "",
+                "변경": (ch.group(1) == "Y") if ch else None,
+                "block": blk,
+            })
+        return out
+
+    # ---------- 조문 키워드 검색 (한 법령 안에서) ----------
+    def law_article_search(self, law_name: str, keyword: str, law_id: str = "",
+                           as_of_date: str = "", mst: str = "", max_results: int = 20,
+                           snippet_chars: int = 160):
+        """법령 원문에서 키워드가 들어간 조문을 찾는다. 공백으로 나눈 단어는 모두
+        포함해야 일치(AND). 조문 제목 일치를 본문 일치보다 앞에 둔다."""
+        terms = [t for t in (keyword or "").split() if t]
+        if not terms:
+            raise LawGoKrError("keyword가 비어 있습니다")
+        mst, meta = self._resolve_version(law_name, law_id, as_of_date, mst)
+        xml = _get("lawService.do", target="law", MST=mst)
+        name = re.search(r"<법령명_한글>(.*?)</법령명_한글>", xml, re.S)
+        arts = self._iter_articles(xml)
+        if not arts:
+            raise LawGoKrParseError(f"MST {mst} 응답에서 조문을 찾지 못함 — 응답 앞부분: {xml[:200]}")
+        hits = []
+        for a in arts:
+            text = "\n".join(self._article_content_lines(a["block"]))
+            hay = a["조문제목"] + "\n" + text
+            if not all(t in hay for t in terms):
+                continue
+            pos = text.find(terms[0])
+            half = max(40, snippet_chars // 2)
+            if pos == -1:
+                snip = text[:snippet_chars]
+            else:
+                s = max(0, pos - half)
+                snip = ("…" if s else "") + text[s:pos + half] + ("…" if pos + half < len(text) else "")
+            hits.append({
+                "조문": a["조문"], "조문제목": a["조문제목"],
+                "일치횟수": sum(hay.count(t) for t in terms),
+                "발췌": snip.replace("\n", " "),
+                "_title_hit": any(t in a["조문제목"] for t in terms),
+            })
+        hits.sort(key=lambda h: not h.pop("_title_hit"))  # 안정 정렬 — 같은 그룹 안은 조문 순서 유지
+        out = {
+            "법령명": _strip_cdata(name.group(1)) if name else meta.get("법령명", ""),
+            "시행본": meta,
+            "검색어": terms,
+            "일치조문수": len(hits),
+            "결과": hits[:max(1, max_results)],
+        }
+        if len(hits) > max_results:
+            out["안내"] = f"일치 {len(hits)}건 중 {max_results}건만 표시 — 검색어를 더 붙여 좁히거나 max_results를 늘리세요"
+        if not hits:
+            out["status"] = "NOT_FOUND"
+            out["_guidance"] = ("이 시행본의 조문에 검색어가 없음 (조회 자체는 정상). 시행령·시행규칙에 "
+                                "있을 수 있으니 law_name을 바꿔 보거나 단어를 줄여 재검색")
+        out["조회방법"] = "조문 전문은 law_article_as_of(law_name, 날짜, 조번호)로 조회"
+        return out
+
+    # ---------- 시행 예정 개정 (공포됐으나 아직 시행 전) ----------
+    @staticmethod
+    def _article1_section(addendum_body: str) -> str:
+        """부칙 제1조(시행일) 본문 — 조 편제 없는 단순 부칙이면 머리말 다음 전체."""
+        m = re.search(r"(?m)^\s*제1조\s*\([^)]*\)", addendum_body)
+        if not m:
+            lines = addendum_body.splitlines()
+            return "\n".join(lines[1:]) if len(lines) > 1 else addendum_body
+        nxt = re.search(r"(?m)^\s*제2조\s*\(", addendum_body[m.end():])
+        return addendum_body[m.end(): m.end() + nxt.start()] if nxt else addendum_body[m.end():]
+
+    @classmethod
+    def _staged_items(cls, addendum_body: str):
+        """부칙 제1조 단서의 '각 호' 목록 → [(시행일 YYYYMMDD, 호 문장)].
+        예: '2. 제17조제3항 및 제118조의9부터 …: 2027년 1월 1일' → ('20270101', '2. …')"""
+        out = []
+        sec = cls._article1_section(addendum_body)
+        for ln in sec.splitlines():
+            t = ln.strip()
+            if re.match(r"^\d+\.", t):
+                d = _korean_date_to_ymd(t.rsplit(":", 1)[-1]) or _korean_date_to_ymd(t)
+                if d:
+                    out.append((d, t))
+        return out
+
+    def law_upcoming(self, law_name: str, law_id: str = "", max_versions: int = 5,
+                     today: str = ""):
+        """공포됐으나 아직 시행되지 않은 개정(시행예정 시행본)과, 시행일마다 어떤
+        조문이 바뀌는지를 정리한다.
+
+        근거 우선순위: ① 그 공포본 부칙 제1조 단서의 '각 호' (조문별 시행일이 다른 경우 —
+        2026-08 실측 소득세법 제21221호: '2. 제17조제3항 및 제118조의9부터 …: 2027년 1월 1일')
+        ② 본칙 시행일이 그날이면 그 공포본에서 <조문변경여부>Y인 조문(단서 호에 든 조문 제외).
+        """
+        today = today or time.strftime("%Y%m%d")
+        history = self.law_history(law_name, law_id=law_id)
+        if not history:
+            raise LawGoKrNotFound(f"연혁 없음: {law_name}")
+        future = [r for r in history if (r.get("시행일자") or "") > today]
+        out = {"법령명": history[-1].get("법령명", law_name), "기준일": today,
+               "시행예정_건수": len(future)}
+        if not future:
+            out["status"] = "NOT_FOUND"
+            out["_guidance"] = (f"{today} 이후 시행 예정인 시행본 없음 (연혁 조회는 정상) — "
+                                f"공포 전 개정안(국회 계류·입법예고)은 이 자료에 없음")
+            return out
+        # 시행일 오름차순, 같은 날 같은 MST 중복 행 제거
+        seen, rows = set(), []
+        for r in sorted(future, key=lambda r: (r["시행일자"], r.get("공포일자", ""))):
+            k = (r["시행일자"], r["MST"])
+            if k not in seen:
+                seen.add(k)
+                rows.append(r)
+        xml_cache, versions = {}, []
+        for r in rows[:max(1, max_versions)]:
+            v = {k: r.get(k, "") for k in ("시행일자", "공포일자", "공포번호", "제개정구분", "MST")}
+            try:
+                if r["MST"] not in xml_cache:
+                    xml_cache[r["MST"]] = _get("lawService.do", target="law", MST=r["MST"])
+                xml = xml_cache[r["MST"]]
+            except (LawGoKrAuthError, requests.exceptions.RequestException) as e:
+                v["오류"] = f"시행본 원문 조회 실패 — {type(e).__name__}: {e}"
+                versions.append(v)
+                continue
+            arts = self._iter_articles(xml)
+            titles = {a["조문"]: a["조문제목"] for a in arts}
+            base = re.search(r"<시행일자>(\d+)</시행일자>", xml)
+            base_date = base.group(1) if base else ""
+            want = (r.get("공포번호") or "").lstrip("0")
+            unit = next((u for u in self._parse_addenda_units(xml) if u["공포번호"] == want), None)
+            staged = self._staged_items(unit["본문"]) if unit else []
+            if unit:
+                v["부칙_시행일"] = self._effective_summary(unit["본문"], limit=600)
+            todays = [t for d, t in staged if d == r["시행일자"]]
+            basis = "부칙 제1조 단서 각 호 (조문별 시행일)"
+            if not todays and unit and base_date != r["시행일자"]:
+                # 호 목록 없이 단서 문장으로 쓴 부칙: "다만, 제x조의 개정규정은 2027년 1월 1일부터 …"
+                sec = self._article1_section(unit["본문"])
+                for sent in re.split(r"(?<=다\.)\s*|\n", sec):
+                    if _korean_date_to_ymd(sent) == r["시행일자"] and re.search(r"제\d+조", sent):
+                        todays.append(sent.strip())
+                basis = "부칙 제1조 단서 문장 (조문별 시행일)"
+            if todays:
+                labels = []
+                order = [a["조문"] for a in arts]
+                art_re = r"제(\d+)조(?:의(\d+))?(?:제\d+항)?(?:제\d+호)?"
+                for t in todays:
+                    head = t.split(":")[0]
+                    # "제118조의9부터 제118조의18까지" — 범위 안의 조문을 원문 순서로 펼친다
+                    for rm in re.finditer(art_re + r"\s*부터\s*" + art_re + r"\s*까지", head):
+                        a0 = _article_label(rm.group(1), rm.group(2) or "")
+                        a1 = _article_label(rm.group(3), rm.group(4) or "")
+                        if a0 in order and a1 in order and order.index(a0) <= order.index(a1):
+                            for lb in order[order.index(a0): order.index(a1) + 1]:
+                                if lb not in labels:
+                                    labels.append(lb)
+                    for lm in re.finditer(r"제(\d+)조(?:의(\d+))?", head):
+                        lb = _article_label(lm.group(1), lm.group(2) or "")
+                        if lb not in labels:
+                            labels.append(lb)
+                labels.sort(key=lambda lb: order.index(lb) if lb in order else len(order))
+                v["근거"] = basis
+                v["이날_시행되는_개정규정"] = todays
+                v["언급_조문"] = [{"조문": lb, "조문제목": titles.get(lb, "")} for lb in labels]
+            elif base_date == r["시행일자"]:
+                staged_labels = {(_article_label(m.group(1), m.group(2) or ""))
+                                 for _d, t in staged
+                                 for m in re.finditer(r"제(\d+)조(?:의(\d+))?", t.split(":")[0])}
+                changed = [{"조문": a["조문"], "조문제목": a["조문제목"]}
+                           for a in arts if a["변경"] and a["조문"] not in staged_labels]
+                v["근거"] = "본칙 시행일 — 이 공포본에서 개정 표시(<조문변경여부>Y)된 조문"
+                v["개정_조문"] = changed
+                if staged:
+                    v["참고"] = "부칙 단서 호에 든 조문은 각 호의 날짜에 따로 시행되므로 제외함"
+            else:
+                v["근거"] = "확인 불가"
+                v["안내"] = ("이 시행일에 어떤 조문이 시행되는지 부칙 단서에서 찾지 못함 — "
+                            "law_addenda_search(promul_no=공포번호)로 부칙 전문을 확인하세요")
+            versions.append(v)
+        out["시행예정"] = versions
+        if len(rows) > len(versions):
+            out["안내"] = f"시행예정 {len(rows)}건 중 가까운 {len(versions)}건만 표시 — max_versions를 늘리세요"
+        out["조회방법"] = ("개정 후 문안은 law_article_as_of(law_name, 시행일자, 조번호), "
+                         "현행과의 대비는 law_article_diff(law_name, 조번호, 오늘, 시행일자)")
+        return out
+
+    # ---------- 별표·서식 ----------
+    _ANNEX_FIELDS = ("별표번호", "별표가지번호", "별표구분", "별표제목", "별표시행일자",
+                     "별표서식파일링크", "별표HWP파일명", "별표서식PDF파일링크", "별표PDF파일명",
+                     "별표내용")
+
+    @classmethod
+    def _parse_annex_units(cls, xml: str):
+        """lawService target=law 응답의 <별표단위> 목록 (필드명: open.law.go.kr
+        현행법령 본문 조회 가이드 — 별표번호·별표가지번호·별표구분·별표제목·별표시행일자·
+        별표서식파일링크·별표HWP파일명·별표서식PDF파일링크·별표PDF파일명·별표내용)."""
+        units = []
+        for m in re.finditer(r"<별표단위[^>]*>(.*?)</별표단위>", xml, re.S):
+            blk = m.group(1)
+            d = {}
+            for tag in cls._ANNEX_FIELDS:
+                fm = re.search(rf"<{tag}>(.*?)</{tag}>", blk, re.S)
+                d[tag] = _strip_cdata(fm.group(1)) if fm else ""
+            no = d["별표번호"].lstrip("0") or d["별표번호"]
+            br = d["별표가지번호"].lstrip("0")
+            kind = d["별표구분"] or "별표"
+            body = _strip_tags(d["별표내용"])
+            body = re.sub(r"[ \t]+\n", "\n", body).strip()
+            units.append({
+                "번호": f"{kind} {no}" + (f"의{br}" if br else ""),
+                "_no": no, "_br": br,
+                "구분": kind,
+                "제목": _strip_tags(d["별표제목"]),
+                "시행일자": d["별표시행일자"],
+                "HWP": _abs_link(d["별표서식파일링크"]),
+                "PDF": _abs_link(d["별표서식PDF파일링크"]),
+                "_body": body,
+            })
+        return units
+
+    def law_annexes(self, law_name: str = "", annex_no: str = "", keyword: str = "",
+                    kind: str = "", law_id: str = "", as_of_date: str = "", mst: str = "",
+                    max_chars: int = 8000):
+        """한 법령의 별표·서식 목록 / 본문.
+        - annex_no 없음: 목록 (번호·구분·제목·시행일자·HWP/PDF 링크). keyword로 제목·본문 필터
+        - annex_no('1', '1의2', '별표 1의2'): 그 별표 본문 전문 + 원본 링크
+        kind: '별표' 또는 '서식'으로 좁힘 (별표 1과 별지 제1호서식이 번호가 겹칠 수 있음)"""
+        mst, meta = self._resolve_version(law_name, law_id, as_of_date, mst)
+        xml = _get("lawService.do", target="law", MST=mst)
+        name = re.search(r"<법령명_한글>(.*?)</법령명_한글>", xml, re.S)
+        units = self._parse_annex_units(xml)
+        out = {"법령명": _strip_cdata(name.group(1)) if name else meta.get("법령명", ""),
+               "시행본": meta, "별표총수": len(units)}
+        if not units:
+            flag = re.search(r"<별표편집여부>(\w)</별표편집여부>", xml)
+            out["status"] = "NOT_FOUND"
+            out["_guidance"] = ("이 시행본 원문에 별표가 없음 (조회는 정상). 별표는 대개 시행령·시행규칙에 "
+                                "있으니 law_name을 '○○법 시행령'으로 바꿔 보세요"
+                                + (" — 원문 헤더는 별표 있음(Y)으로 표시돼 있어 응답 구조 확인 필요"
+                                   if flag and flag.group(1) == "Y" else ""))
+            return out
+        if kind:
+            units = [u for u in units if kind in u["구분"]] or units
+
+        if annex_no:
+            am = re.search(r"(\d+)(?:\s*의\s*(\d+))?", annex_no)
+            if not am:
+                raise LawGoKrError(f"annex_no 형식 오류: '{annex_no}' (예: '1', '1의2')")
+            no, br = am.group(1), (am.group(2) or "")
+            hits = [u for u in units if u["_no"] == no and u["_br"] == br]
+            if not kind and len({u["구분"] for u in hits}) > 1:
+                pref = [u for u in hits if "별표" in u["구분"]]
+                hits = pref or hits
+            if not hits:
+                raise LawGoKrNotFound(
+                    f"{annex_no} 없음 — 이 시행본의 별표·서식은 {len(units)}건: "
+                    + ", ".join(u["번호"] for u in units[:30]))
+            u = hits[0]
+            body = u["_body"]
+            out["별표"] = {k: u[k] for k in ("번호", "구분", "제목", "시행일자", "HWP", "PDF")}
+            out["별표"]["본문"] = body[:max_chars]
+            out["별표"]["본문길이"] = len(body)
+            if len(body) > max_chars:
+                out["잘림"] = f"본문 {len(body)}자 중 앞 {max_chars}자만 표시 — max_chars를 늘려 재조회"
+            if len(body) < 80:
+                out["안내"] = ("텍스트 본문이 거의 없음 — 표·서식이 이미지로만 수록된 별표일 수 있으니 "
+                              "HWP·PDF 링크로 원본을 확인하세요")
+            else:
+                out["안내"] = ("텍스트 표는 칸 정렬이 깨질 수 있음 — 세율·금액처럼 숫자가 결론을 좌우하면 "
+                              "HWP·PDF 원본과 대조하세요")
+            return out
+
+        rows = units
+        if keyword:
+            terms = keyword.split()
+            rows = [u for u in units if all(t in (u["제목"] + "\n" + u["_body"]) for t in terms)]
+        out["목록"] = [{k: u[k] for k in ("번호", "구분", "제목", "시행일자", "HWP", "PDF")} for u in rows]
+        if keyword:
+            out["검색어"] = keyword
+            if not rows:
+                out["status"] = "NOT_FOUND"
+                out["_guidance"] = "제목·본문에 검색어가 든 별표 없음 (조회는 정상) — 단어를 줄여 재검색"
+        out["조회방법"] = "본문은 annex_no에 번호(예: '1', '1의2')를 지정해 다시 호출"
+        return out
+
+    def search_annex_files(self, keyword: str, search_scope: str = "title", kind: str = "",
+                           display: int = 20, page: int = 1):
+        """target=licbyl 법령 별표서식 목록 검색 (여러 법령에 걸쳐).
+        search_scope: 'title'(별표서식명, 기본) | 'law'(해당 법령명) | 'body'(별표 본문)
+        kind: '별표'·'서식'·'별지'·'별도'·'부록' (빈값=전체)
+        응답 필드명은 open.law.go.kr 별표서식 목록 조회 가이드 기준. 반복 항목 태그는
+        가이드에 명시가 없어 'licbyl'로 가정 — 건수는 있는데 항목이 0이면 PARSE_ERROR."""
+        scope = {"title": 1, "law": 2, "body": 3}.get(search_scope)
+        if not scope:
+            raise LawGoKrError(f"search_scope는 title·law·body 중 하나: '{search_scope}'")
+        knd = {"별표": 1, "서식": 2, "별지": 3, "별도": 4, "부록": 5}.get(kind, "") if kind else ""
+        if kind and not knd:
+            raise LawGoKrError(f"kind는 별표·서식·별지·별도·부록 중 하나: '{kind}'")
+        xml = _get("lawSearch.do", target="licbyl", query=keyword, search=scope,
+                   knd=knd, display=display, page=page)
+        items = _parse_items(xml, "licbyl")
+        total = re.search(r"<totalCnt>(\d+)</totalCnt>", xml)
+        total_n = int(total.group(1)) if total else len(items)
+        if total_n and not items:
+            raise LawGoKrParseError(f"검색 건수 {total_n}건인데 항목을 해석하지 못함 — "
+                                    f"응답 앞부분: {xml[:300]}")
+        return {
+            "검색어": keyword, "검색범위": search_scope, "총건수": total_n, "page": page,
+            "결과": [{
+                "별표일련번호": it.get("별표일련번호", ""),
+                "별표명": it.get("별표명", ""),
+                "별표번호": it.get("별표번호", ""),
+                "별표종류": it.get("별표종류", ""),
+                "관련법령명": it.get("관련법령명", ""),
+                "관련법령ID": it.get("관련법령ID", ""),
+                "관련법령MST": it.get("관련법령일련번호", ""),
+                "공포일자": it.get("공포일자", ""),
+                "HWP": _abs_link(it.get("별표서식파일링크", "")),
+                "PDF": _abs_link(it.get("별표서식PDF파일링크", "")),
+            } for it in items],
+            "조회방법": "본문은 law_annex_search(mst=관련법령MST, annex_no=별표번호)",
         }
 
     # ---------- 편의: 특정 날짜 시행본의 조문 (예규 당시 조문 확인용) ----------
