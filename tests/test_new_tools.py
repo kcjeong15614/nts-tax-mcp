@@ -405,6 +405,33 @@ def test_get_reports_auth_error_through_safe():
     assert not L._cache, "잘못된 응답이 캐시되면 안 됨"
 
 
+def test_get_param_order_oc_target_type():
+    """요청 쿼리스트링이 OC → target → type 순서로 시작해야 한다 (law.go.kr 필수입력 검증)."""
+    seen = {}
+
+    class R:
+        status_code = 200
+        text = "<LawSearch><totalCnt>0</totalCnt></LawSearch>"
+
+        def raise_for_status(self):
+            pass
+
+    def fake_get(url, params=None, **kw):
+        seen["params"], seen["headers"] = params, kw.get("headers", {})
+        return R()
+    orig_get, orig_oc = L.requests.get, L.OC
+    L.requests.get, L.OC = fake_get, "test"
+    L._cache.clear()
+    try:
+        L._get("lawSearch.do", target="law", query="소득세법", display=20)
+    finally:
+        L.requests.get, L.OC = orig_get, orig_oc
+        L._cache.clear()
+    keys = [k for k, _ in seen["params"]]
+    assert keys[:3] == ["OC", "target", "type"], keys
+    assert "Mozilla" in seen["headers"]["User-Agent"]
+
+
 def test_base_is_https():
     assert L.BASE.startswith("https://"), L.BASE
 
