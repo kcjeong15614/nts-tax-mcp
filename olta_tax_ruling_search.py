@@ -399,8 +399,9 @@ class OltaTaxLawClient:
         resp.encoding = "utf-8"
 
         soup = BeautifulSoup(resp.text, "html.parser")
-        content_div = soup.find("div", class_="cont") or soup.find("div", id="content") or soup.body
-        text = content_div.get_text("\n", strip=True) if content_div else ""
+        content_div = (soup.find("div", id="print_contents") or soup.find("div", class_="cont")
+                       or soup.find("div", id="content") or soup.body)
+        text = self._block_text(content_div) if content_div else ""
 
         if len(text) < 100:
             return {
@@ -412,6 +413,24 @@ class OltaTaxLawClient:
             }
 
         return {"status": "OK", "found": True, "url": url, "content": text}
+
+    _BLOCK_TAGS = ("p", "div", "li", "tr", "table", "dt", "dd", "h1", "h2", "h3", "h4", "h5", "h6")
+
+    @classmethod
+    def _block_text(cls, node) -> str:
+        """블록 요소 경계에서만 줄을 바꾼다. 상세 본문은 한 문단이 글자 몇 개씩의 <span>으로
+        잘려 있어 get_text("\\n")을 쓰면 '제\\n13\\n조'처럼 조각마다 줄이 바뀌었다
+        (조심2025지1784, 2026-11-20). 상세 페이지 상단의 '다운로드·프린트' 버튼은
+        div#print_contents 밖에 있어 함께 빠진다."""
+        for sp in node.select("p.data_num > span"):  # '취득세<span>취소</span>' → '취득세 취소'
+            sp.insert_before(" ")
+        for br in node.find_all("br"):
+            br.replace_with("\n")
+        for tag in node.find_all(cls._BLOCK_TAGS):
+            tag.append("\n")
+        raw = node.get_text("").replace("\xa0", " ").replace("\r", "")
+        lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in raw.split("\n")]
+        return "\n".join(ln for ln in lines if ln)
 
     def _search_uncached(self, keyword: str) -> dict:
         html = self._post_search(keyword)

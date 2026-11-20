@@ -98,10 +98,14 @@ def court_case_detail(case_serial: str, max_chars: int = 8000) -> dict:
 @mcp.tool()
 def law_interpretation_search(keyword: str, display: int = 10,
                               serial: str = "") -> object:
-    """법제처 법령해석례 검색/조회.
+    """법제처 법령해석례 검색/조회 (세법뿐 아니라 모든 법령의 해석례).
 
     serial 없이 호출하면 키워드 검색(안건명·회신기관·회신일자 목록),
     serial(해석례일련번호)을 주면 질의요지·회답·이유 전문을 반환한다.
+
+    안건명 검색이라 "1세대 1주택"처럼 일반적인 말은 주택법·건축 해석례가 섞인다.
+    세법 해석례를 찾을 때는 세목명·법령명을 함께 넣는다 (예: "양도소득세 1세대 1주택",
+    "소득세법 시행령 제154조").
     """
     if serial:
         return _safe(_law.get_interpretation, serial)
@@ -217,11 +221,14 @@ def law_addenda_search(law_name: str = "", mst: str = "", law_id: str = "",
 def admin_rule_search(keyword: str, serial: str = "", display: int = 10,
                       article: str = "", max_chars: int = 10000,
                       start_char: int = 0) -> object:
-    """행정규칙(훈령·예규·고시) 검색/조회 — 기본통칙·조사사무처리규정·국세청 고시·외국환거래규정.
+    """행정규칙(훈령·예규·고시) 검색/조회 — 조사사무처리규정·국세청 고시·외국환거래규정.
 
     serial 없이 호출하면 키워드 검색(규칙명·종류·소관부처·발령일자 목록),
     serial(일련번호)을 주면 본문을 반환한다.
-    예: "법인세법 기본통칙", "조사사무처리규정", "외국환거래규정"
+    예: "조사사무처리규정", "외국환거래규정", "국세청 고시"
+
+    국세청 기본통칙·집행기준은 법제처 행정규칙 DB에 없다(검색 0건) — 국세법령정보시스템
+    검색(nts_ruling_search)으로 찾는다.
 
     외국환거래규정(30만 자) 같은 대형 고시는 전문이 max_chars에 잘리므로
     article에 조번호를 지정해 해당 조문만 받는 것을 권장한다
@@ -277,15 +284,25 @@ def treaty_search(keyword: str = "", serial: str = "", display: int = 10,
 
 
 @mcp.tool()
-def ordinance_search(keyword: str, region: str = "", serial: str = "", display: int = 20) -> object:
+def ordinance_search(keyword: str, region: str = "", serial: str = "", display: int = 20,
+                     max_chars: int = 10000, start_char: int = 0) -> object:
     """자치법규(조례·규칙) 검색/조회 — 지방세 탄력세율·감면조례 확인용.
 
-    serial 없이 호출하면 키워드 검색, region으로 지자체 필터(예: "서울", "용산구").
-    serial(일련번호)을 주면 본문을 반환한다.
-    예: keyword="시세 감면", region="서울" / keyword="도시계획세"
+    serial 없이 호출하면 키워드 검색, region으로 지자체 필터(예: "부산", "용산구").
+    region을 주면 검색 결과를 최대 500건까지 넘겨 보며 거르므로 display가 작아도 된다.
+    serial(검색 결과의 '일련번호')을 주면 조문·부칙 본문을 반환한다.
+    예: keyword="시세 감면", region="부산" / keyword="부산광역시 시세 감면 조례"
+
+    Args:
+        keyword: 검색어 (자치법규명 기준)
+        region: 지자체명 일부 (응답의 '지자체'에 이 문자열이 든 것만)
+        serial: 자치법규 일련번호 — 지정하면 본문 조회
+        display: 검색 결과 수 (기본 20)
+        max_chars: 본문 최대 길이 (기본 10000)
+        start_char: 본문 시작 오프셋 — 응답의 "잘림" 안내를 따라 이어 읽기
     """
     if serial:
-        return _safe(_law.get_ordinance, serial)
+        return _safe(_law.get_ordinance, serial, max_chars, start_char)
     return _safe(_law.search_ordinances, keyword, region, display)
 
 
@@ -341,7 +358,9 @@ def law_annex_search(law_name: str = "", annex_no: str = "", keyword: str = "",
     """별표·서식 조회 — 세율표·기준금액·업종 분류표 등 별표 본문과 원본 HWP·PDF 링크.
 
     세 가지 사용법:
-    1) 목록: law_name만 주면 그 법령(시행본)의 별표·서식 목록 (번호·제목·시행일자·HWP/PDF 링크).
+    1) 목록: law_name만 주면 그 법령(시행본)의 별표·서식 목록 (번호·제목·최종개정·HWP/PDF 링크).
+       '최종개정'은 별표 본문 머리의 <개정 …> 표기 — 원문에 별표별 시행일 필드는 없으므로
+       시행 시점은 그 개정의 부칙(law_addenda_search)으로 확인.
        keyword를 함께 주면 제목·본문에 그 단어가 든 별표만.
     2) 본문: annex_no 지정 ("1", "1의2") — 그 별표 텍스트 전문 + 원본 링크.
     3) 법령 횡단 검색: law_name·mst 없이 keyword만 — 모든 법령의 별표·서식에서 검색

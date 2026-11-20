@@ -85,6 +85,22 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s)
 
 
+def _strip_html(s: str) -> str:
+    """HTML 태그(영문 태그명)만 지운다. 별표·자치법규 본문의 '<개정 2026. 2. 27.>',
+    '<신설 2020. 5. 27.>' 같은 한글 꺾쇠 표기는 태그가 아니라 내용이므로 남긴다
+    (_strip_tags는 이것까지 지워 개정일 정보가 사라졌다 — 2026-11-20 실응답 확인)."""
+    return re.sub(r"</?[A-Za-z][^>]*>", "", s)
+
+
+_AMEND_RE = re.compile(r"<\s*((?:개정|신설|전문개정|제정)\s*[^<>]*?)\s*>")
+
+
+def _amend_note(text: str) -> str:
+    """본문 머리의 '<개정 2026. 2. 27.>' 표기 → '개정 2026. 2. 27.' (없으면 빈 문자열)."""
+    m = _AMEND_RE.search(text or "")
+    return re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+
+
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
@@ -478,14 +494,19 @@ class LawGoKrClient:
             mst = chosen["MST"]
         xml = _get("lawService.do", target="law", MST=mst)
         name = re.search(r"<법령명_한글>(.*?)</법령명_한글>", xml, re.S)
+        # 원문 <기본정보>의 시행일자는 이 공포본 부칙의 본칙 시행일이다. 연혁 목록·검색의
+        # '시행일자'(이 MST가 마지막으로 바뀐 날)와 다를 수 있다 — 예: 소득세법 MST 280405는
+        # 목록상 20260701, 기본정보상 20260101 (2026-11-20).
         enf = re.search(r"<시행일자>(\d+)</시행일자>", xml)
+        pno = re.search(r"<공포번호>(\d+)</공포번호>", xml)
         units = self._parse_addenda_units(xml)
         if not units:
             raise LawGoKrNotFound(f"MST {mst} 응답에 부칙 없음 — 응답 앞부분: {xml[:200]}")
         out = {
             "법령명": _strip_cdata(name.group(1)) if name else "",
             "MST": mst,
-            "시행본_시행일자": enf.group(1) if enf else "",
+            "공포번호": pno.group(1) if pno else "",
+            "본칙_시행일자": enf.group(1) if enf else "",
             "부칙총수": len(units),
         }
         # 조문별 시행일이 다른 개정이면 그 내역이 헤더에 요약돼 있다
@@ -734,37 +755,108 @@ class LawGoKrClient:
         return out
 
     # ---------- 자치법규 (조례·규칙) ----------
-    def search_ordinances(self, keyword: str, region: str = "", display: int = 20, page: int = 1):
-        """target=ordin 자치법규 검색. region으로 지자체명 필터 (예: '서울', '용산구')."""
-        xml = _get("lawSearch.do", target="ordin", query=keyword, display=display, page=page)
-        items = _parse_items(xml, "law") + _parse_items(xml, "ordin")
-        rows = []
-        for it in items:
-            org = it.get("지자체기관명", it.get("소관부처명", ""))
-            if region and region not in org:
-                continue
-            rows.append({
-                "일련번호": it.get("자치법규일련번호", it.get("법령일련번호", "")),
-                "자치법규명": it.get("자치법규명", it.get("법령명한글", "")),
-                "지자체": org,
-                "공포일자": it.get("공포일자", ""),
-                "시행일자": it.get("시행일자", ""),
-                "제개정구분": it.get("제개정구분명", ""),
-            })
-        return rows
-
-    def get_ordinance(self, serial: str, max_chars: int = 10000):
-        """target=ordin 자치법규 본문."""
-        xml = _get("lawService.do", target="ordin", ID=serial)
-        name = re.search(r"<자치법규명>(.*?)</자치법규명>", xml, re.S)
-        body = _strip_tags(_strip_cdata(xml))
-        if len(body) < 50:
-            return {"오류": "본문 없음", "응답": xml[:200]}
+    @staticmethod
+    def _ordinance_row(it: dict) -> dict:
         return {
-            "자치법규명": _strip_cdata(name.group(1)) if name else "",
-            "본문": body[:max_chars],
+            "일련번호": it.get("자치법규일련번호", it.get("법령일련번호", "")),
+            "자치법규명": it.get("자치법규명", it.get("법령명한글", "")),
+            "지자체": it.get("지자체기관명", it.get("소관부처명", "")),
+            "공포일자": it.get("공포일자", ""),
+            "시행일자": it.get("시행일자", ""),
+            "제개정구분": it.get("제개정구분명", ""),
+        }
+
+    _ORDIN_PAGE = 100     # 지역 필터 시 한 번에 받는 건수 (law.go.kr display 최대)
+    _ORDIN_MAX_PAGES = 5  # 지역 필터 시 최대 500건까지 훑는다
+
+    def search_ordinances(self, keyword: str, region: str = "", display: int = 20, page: int = 1):
+        """target=ordin 자치법규 검색. region으로 지자체명 필터 (예: '서울', '용산구').
+
+        지역 필터는 law.go.kr가 아니라 여기서 건다. 예전에는 display건만 받아 그 안에서
+        걸러서, '시세 감면'+'부산'+display=3이면 부산광역시 조례가 4번째 이후라 0건으로
+        나왔다 (2026-11-20). region이 있으면 페이지를 넘기며 충분히 받은 뒤 거른다."""
+        if not region:
+            xml = _get("lawSearch.do", target="ordin", query=keyword, display=display, page=page)
+            items = _parse_items(xml, "law") + _parse_items(xml, "ordin")
+            return [self._ordinance_row(it) for it in items]
+
+        rows, scanned, total_n = [], 0, None
+        for pg in range(1, self._ORDIN_MAX_PAGES + 1):
+            xml = _get("lawSearch.do", target="ordin", query=keyword,
+                       display=self._ORDIN_PAGE, page=pg)
+            if total_n is None:
+                t = re.search(r"<totalCnt>(\d+)</totalCnt>", xml)
+                total_n = int(t.group(1)) if t else 0
+            items = _parse_items(xml, "law") + _parse_items(xml, "ordin")
+            scanned += len(items)
+            rows += [r for r in map(self._ordinance_row, items) if region in r["지자체"]]
+            if not items or scanned >= total_n:
+                break
+        start = (max(page, 1) - 1) * display
+        picked = rows[start:start + display]
+        if not picked:
+            more = (f" (전체 {total_n}건 중 앞 {scanned}건만 확인 — 검색어에 지자체명을 넣어 좁히세요)"
+                    if total_n and scanned < total_n else "")
+            raise LawGoKrNotFound(
+                f"'{keyword}' 검색 {total_n or 0}건 중 지자체명에 '{region}'이 든 자치법규 없음{more}")
+        return picked
+
+    @staticmethod
+    def _ordinance_text(xml: str) -> str:
+        """자치법규 본문 XML → 읽을 수 있는 텍스트 (조문 → 부칙 순).
+        <조문><조><조문번호/><조문여부/><조제목/><조내용/></조>…</조문><부칙><부칙내용/></부칙>"""
+        parts = []
+        for m in re.finditer(r"<조내용>(.*?)</조내용>", xml, re.S):
+            t = _strip_html(_strip_cdata(m.group(1))).strip()
+            if t:
+                parts.append(t)
+        adds = [_strip_html(_strip_cdata(m.group(1))).strip()
+                for m in re.finditer(r"<부칙내용>(.*?)</부칙내용>", xml, re.S)]
+        adds = [a for a in adds if a]
+        if adds:
+            parts.append("[부칙]\n" + "\n".join(adds))
+        text = "\n".join(parts).replace("\r\n", "\n").replace("\r", "\n")
+        return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    def get_ordinance(self, serial: str, max_chars: int = 10000, start_char: int = 0):
+        """target=ordin 자치법규 본문.
+
+        serial은 검색 결과의 '일련번호'(자치법규일련번호)이므로 MST로 보낸다. 예전에는 ID로
+        보내 자치법규ID가 우연히 같은 다른 조례가 왔다 (부산광역시 시세 감면 조례 2130441 →
+        태백시 기업 및 투자유치 지원에 관한 조례 시행규칙, 2026-11-20)."""
+        serial = str(serial).strip()
+        if not serial.isdigit():
+            raise LawGoKrError(f"serial은 검색 결과의 일련번호(숫자): '{serial}'")
+        xml = _get("lawService.do", target="ordin", MST=serial)
+
+        def field(tag):
+            m = re.search(rf"<{tag}>(.*?)</{tag}>", xml, re.S)
+            return _strip_cdata(m.group(1)) if m else ""
+
+        got = field("자치법규일련번호")
+        if got and got != serial:
+            raise LawGoKrParseError(f"요청한 일련번호 {serial}와 다른 자치법규({got})가 응답됨 — 조회 중단")
+        body = self._ordinance_text(xml)
+        if len(body) < 20:
+            raise LawGoKrNotFound(f"일련번호 {serial}의 본문 없음 — 응답 앞부분: {xml[:200]}")
+        start_char = max(int(start_char or 0), 0)
+        window = body[start_char:start_char + max_chars]
+        out = {
+            "자치법규명": field("자치법규명"),
+            "지자체": field("지자체기관명"),
+            "일련번호": got or serial,
+            "자치법규ID": field("자치법규ID"),
+            "공포일자": field("공포일자"),
+            "공포번호": field("공포번호"),
+            "시행일자": field("시행일자"),
+            "제개정구분": field("제개정정보"),
+            "본문": window,
             "본문길이": len(body),
         }
+        if start_char + len(window) < len(body):
+            out["잘림"] = (f"전체 {len(body)}자 중 {start_char}~{start_char + len(window)}자만 표시 — "
+                         f"start_char={start_char + len(window)}로 이어 읽기")
+        return out
 
     # ---------- 공통: 시행본 선택 · 조문 목록 ----------
     def _resolve_version(self, law_name: str = "", law_id: str = "", as_of_date: str = "",
@@ -1039,15 +1131,16 @@ class LawGoKrClient:
         return out
 
     # ---------- 별표·서식 ----------
-    _ANNEX_FIELDS = ("별표번호", "별표가지번호", "별표구분", "별표제목", "별표시행일자",
+    # 실응답(소득세법 시행령 MST 290841, 2026-11-20)의 <별표단위> 하위 태그. 가이드에 있던
+    # '별표시행일자'는 실제로 없다 — 별표별 날짜는 본문 첫 줄의 '<개정 YYYY. M. D.>'뿐이다.
+    _ANNEX_FIELDS = ("별표번호", "별표가지번호", "별표구분", "별표제목",
                      "별표서식파일링크", "별표HWP파일명", "별표서식PDF파일링크", "별표PDF파일명",
                      "별표내용")
 
     @classmethod
     def _parse_annex_units(cls, xml: str):
-        """lawService target=law 응답의 <별표단위> 목록 (필드명: open.law.go.kr
-        현행법령 본문 조회 가이드 — 별표번호·별표가지번호·별표구분·별표제목·별표시행일자·
-        별표서식파일링크·별표HWP파일명·별표서식PDF파일링크·별표PDF파일명·별표내용)."""
+        """lawService target=law 응답의 <별표단위> 목록. '최종개정'은 본문 머리의
+        '<개정 …>'·'<신설 …>' 표기에서 뽑는다 (별표 단위의 시행일 필드는 원문에 없음)."""
         units = []
         for m in re.finditer(r"<별표단위[^>]*>(.*?)</별표단위>", xml, re.S):
             blk = m.group(1)
@@ -1058,7 +1151,7 @@ class LawGoKrClient:
             no = d["별표번호"].lstrip("0") or d["별표번호"]
             br = d["별표가지번호"].lstrip("0")
             kind = d["별표구분"] or "별표"
-            body = _strip_tags(d["별표내용"])
+            body = _strip_html(d["별표내용"])
             body = body.replace("\r\n", "\n").replace("\r", "\n")
             body = re.sub(r"[ \t]+\n", "\n", body)
             body = re.sub(r"\n{2,}", "\n", body).strip()
@@ -1066,8 +1159,8 @@ class LawGoKrClient:
                 "번호": f"{kind} {no}" + (f"의{br}" if br else ""),
                 "_no": no, "_br": br,
                 "구분": kind,
-                "제목": _strip_tags(d["별표제목"]),
-                "시행일자": d["별표시행일자"],
+                "제목": _strip_html(d["별표제목"]),
+                "최종개정": _amend_note(body[:300]),
                 "HWP": _abs_link(d["별표서식파일링크"]),
                 "PDF": _abs_link(d["별표서식PDF파일링크"]),
                 "_body": body,
@@ -1078,7 +1171,7 @@ class LawGoKrClient:
                     kind: str = "", law_id: str = "", as_of_date: str = "", mst: str = "",
                     max_chars: int = 8000):
         """한 법령의 별표·서식 목록 / 본문.
-        - annex_no 없음: 목록 (번호·구분·제목·시행일자·HWP/PDF 링크). keyword로 제목·본문 필터
+        - annex_no 없음: 목록 (번호·구분·제목·최종개정·HWP/PDF 링크). keyword로 제목·본문 필터
         - annex_no('1', '1의2', '별표 1의2'): 그 별표 본문 전문 + 원본 링크
         kind: '별표' 또는 '서식'으로 좁힘 (별표 1과 별지 제1호서식이 번호가 겹칠 수 있음)"""
         mst, meta = self._resolve_version(law_name, law_id, as_of_date, mst)
@@ -1117,7 +1210,7 @@ class LawGoKrClient:
                     + ", ".join(u["번호"] for u in units[:30]))
             u = hits[0]
             body = u["_body"]
-            out["별표"] = {k: u[k] for k in ("번호", "구분", "제목", "시행일자", "HWP", "PDF")}
+            out["별표"] = {k: u[k] for k in ("번호", "구분", "제목", "최종개정", "HWP", "PDF")}
             out["별표"]["본문"] = body[:max_chars]
             out["별표"]["본문길이"] = len(body)
             if len(body) > max_chars:
@@ -1134,7 +1227,7 @@ class LawGoKrClient:
         if keyword:
             terms = keyword.split()
             rows = [u for u in units if all(t in (u["제목"] + "\n" + u["_body"]) for t in terms)]
-        out["목록"] = [{k: u[k] for k in ("번호", "구분", "제목", "시행일자", "HWP", "PDF")} for u in rows]
+        out["목록"] = [{k: u[k] for k in ("번호", "구분", "제목", "최종개정", "HWP", "PDF")} for u in rows]
         if keyword:
             out["검색어"] = keyword
             if not rows:
