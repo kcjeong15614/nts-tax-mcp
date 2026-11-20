@@ -81,6 +81,10 @@ def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s)
 
 
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
+
+
 def _check_response(endpoint: str, text: str) -> None:
     """정상 결과가 아닌 응답(미신청·검증 실패 안내문, HTML 오류 페이지 등)을 걸러낸다.
     이걸 놓치면 파서가 항목 0건으로 읽어 NOT_FOUND(부존재)로 보고하는 사고가 난다.
@@ -110,8 +114,14 @@ def _get(endpoint: str, **params) -> str:
     now = time.time()
     if hit and hit[0] > now:
         return hit[1]
-    r = requests.get(f"{BASE}/{endpoint}", params=p, timeout=TIMEOUT,
-                     headers={"User-Agent": "nts-tax-mcp/1.0"})
+    # 파라미터 순서를 공식 샘플 URL과 같게 OC → target → type → 나머지로 고정한다.
+    # dict 순서(OC, type, target …)로 보내면 Render에서 "필수입력요소 검증에 실패하였습니다.
+    # 필수 입력값이 존재하지 않습니다"가 돌아왔다 (2026-11-20). 같은 서버에서 이 순서와
+    # 브라우저 User-Agent를 쓰는 Law MCP(lawApi.ts)는 정상.
+    head = [k for k in ("OC", "target", "type") if k in p]
+    ordered = [(k, p[k]) for k in head] + [(k, v) for k, v in p.items() if k not in head]
+    r = requests.get(f"{BASE}/{endpoint}", params=ordered, timeout=TIMEOUT,
+                     headers={"User-Agent": _UA, "Accept": "application/xml, text/xml, */*"})
     r.raise_for_status()
     text = r.text
     if "인증" in text[:500] and "실패" in text[:500]:
