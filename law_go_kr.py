@@ -1031,20 +1031,39 @@ class LawGoKrClient:
         """다른(이후) 공포본 부칙 제1조 단서 중 '법률 제{promul_no}호 …의 개정규정: {target}'처럼
         이 공포본 조문의 시행일을 정한 호 → [{공포번호, 공포일자, 문장, 대상}]. '대상'은
         '법률 제N호' 뒤쪽(그 공포본 조문 부분)만 잘라 둔 것이다."""
-        key = f"법률 제{promul_no}호"
+        key = re.compile(cls._ACT_KIND + rf"\s*제{promul_no}호")
         refs = []
         for u in units:
             if u["공포번호"] == promul_no or (u.get("공포일자") or "") <= promul_date:
                 continue
             for d, t in cls._staged_items(u["본문"]):
-                if d == target and key in t:
+                km = key.search(t) if d == target else None
+                if km:
                     refs.append({"공포번호": u["공포번호"], "공포일자": u.get("공포일자", ""),
-                                 "문장": t, "대상": t.split(key, 1)[1].split(":")[0]})
+                                 "문장": t, "대상": t[km.end():].split(":")[0]})
         return refs
 
     _ART_RE = r"제(\d+)조(?:의(\d+))?(?:제\d+항)?(?:제\d+호)?"
-    _AMEND_LAW_RE = re.compile(r"법률\s*제(\d+)호\s*(.+?)\s*일부개정법률\s*일부를\s*다음과\s*같이\s*개정한다")
-    _AMEND_LAW_MARK = r"(법률\s*제\d+호\s*\S+(?:\s\S+)?\s*일부개정법률)"
+    # 법령 종류 표기 — 법률은 '법률 제N호 ○○법 일부개정법률', 시행령은 '대통령령 제N호 ○○법 시행령
+    # 일부개정령', 시행규칙은 '총리령/○○부령 제N호 … 일부개정령'으로 쓴다 (2026-11-20 실측:
+    # 소득세법 시행령 제35349호 부칙 '대통령령 제32516호 소득세법 시행령 일부개정령 제88조…').
+    _ACT_KIND = r"(?:법률|대통령령|총리령|[가-힣]+부령)"
+    _ACT_SUFFIX = r"일부개정(?:법률|령|규칙)"
+    _AMEND_LAW_RE = re.compile(_ACT_KIND + r"\s*제(\d+)호\s*(.+?)\s*" + _ACT_SUFFIX
+                               + r"\s*일부를\s*다음과\s*같이\s*개정한다")
+    # 블록 안의 한 줄짜리 개정: '대통령령 제32516호 소득세법 시행령 일부개정령(…) 제216조의4 중 …'
+    _AMEND_INLINE_RE = re.compile(r"^" + _ACT_KIND + r"\s*제(\d+)호\s*(.+?)\s*" + _ACT_SUFFIX
+                                  + r"\s*(제\d+조(?:의\d+)?)")
+    _AMEND_LAW_MARK = (r"(" + _ACT_KIND + r"\s*제\d+호\s*\S+(?:\s\S+)?\s*" + _ACT_SUFFIX + r")")
+
+    @staticmethod
+    def _drop_parens(text: str) -> str:
+        """괄호 안('(…에 따라 개정된 내용을 포함한다)', '(…에 한정한다)')을 지운다 — 바깥쪽 문장이
+        어느 공포본의 어느 조문인지만 가리기 위해."""
+        prev = None
+        while prev != text:
+            prev, text = text, re.sub(r"\([^()]*\)", "", text)
+        return text
 
     @classmethod
     def _labels(cls, head: str, order=None):
@@ -1063,25 +1082,53 @@ class LawGoKrClient:
             lb = _article_label(lm.group(1), lm.group(2) or "")
             if lb not in labels:
                 labels.append(lb)
+        for bm in re.finditer(r"별표\s*(\d+)(?:의(\d+))?", head):  # '별표 5의 개정규정'
+            lb = f"별표 {bm.group(1)}" + (f"의{bm.group(2)}" if bm.group(2) else "")
+            if lb not in labels:
+                labels.append(lb)
         return labels
 
     @classmethod
     def _amended_law_links(cls, text: str, law_name: str = ""):
-        """부칙(대개 타법개정의 '다른 법률의 개정')에서 아직 시행 전인 개정법을 고친 대목을 찾는다.
-        '⑥ 법률 제17757호 소득세법 일부개정법률 일부를 다음과 같이 개정한다.' 다음 줄들의
-        '제21조제1항제27호 중 …' → [{'개정법': '17757', '조문': ['제21조', …], '문장': [...]}]"""
+        """부칙(대개 타법개정의 '다른 법률의 개정')에서 아직 시행 전인 개정법령을 고친 대목을 찾는다.
+        ① 블록형: '⑥ 법률 제17757호 소득세법 일부개정법률 일부를 다음과 같이 개정한다.' 다음 줄들의
+           '제21조제1항제27호 중 …'
+        ② 한 줄형: '대통령령 제32516호 소득세법 시행령 일부개정령(…) 제216조의4 중 …로 한다.'
+        → [{'개정법': '17757', '조문': ['제21조', …], '문장': [...]}] (같은 개정법은 하나로 합침)"""
         lines = [ln.strip() for ln in (text or "").splitlines()]
         want_name = re.sub(r"\s+", "", law_name or "")
-        out, i = [], 0
+
+        def name_ok(name):
+            return not want_name or re.sub(r"\s+", "", name) == want_name
+
+        found = {}
+
+        def add(no, labels, body):
+            km = re.search(r"(" + cls._ACT_KIND + r")\s*제" + no + "호", body[0])
+            d = found.setdefault(no, {"개정법": no, "종류": km.group(1) if km else "",
+                                      "조문": [], "문장": []})
+            d["조문"] += [lb for lb in labels if lb not in d["조문"]]
+            d["문장"] += [t for t in body if t not in d["문장"]]
+
+        i = 0
         while i < len(lines):
-            m = cls._AMEND_LAW_RE.search(lines[i])
-            i += 1
-            if not m or (want_name and re.sub(r"\s+", "", m.group(2)) != want_name):
+            t0 = lines[i]
+            flat = cls._drop_parens(t0)
+            im = cls._AMEND_INLINE_RE.search(flat)
+            if im and name_ok(im.group(2)):
+                lm = re.match(r"제(\d+)조(?:의(\d+))?", im.group(3))
+                add(im.group(1), [_article_label(lm.group(1), lm.group(2) or "")], [t0])
+                i += 1
                 continue
-            labels, body = [], [lines[i - 1]]
+            m = cls._AMEND_LAW_RE.search(t0)
+            i += 1
+            if not m or not name_ok(m.group(2)):
+                continue
+            labels, body = [], [t0]
             while i < len(lines):
                 t = lines[i]
-                if t and (re.match(r"^(?:[①-⑳]|제\d+조(?:의\d+)?\s*\()", t) or cls._AMEND_LAW_RE.search(t)):
+                if t and (re.match(r"^(?:[①-⑳]|<\d+>|제\d+조(?:의\d+)?\s*\()", t)
+                          or cls._AMEND_LAW_RE.search(t) or cls._AMEND_INLINE_RE.search(cls._drop_parens(t))):
                     break
                 lm = re.match(r"^제(\d+)조(?:의(\d+))?", t)
                 if lm:
@@ -1091,19 +1138,25 @@ class LawGoKrClient:
                     body.append(t)
                 i += 1
             if labels:
-                out.append({"개정법": m.group(1), "조문": labels, "문장": body})
-        return out
+                add(m.group(1), labels, body)
+        return list(found.values())
 
     @classmethod
     def _target_day_items(cls, units, target: str):
-        """모든 부칙의 제1조 단서 각 호 중 target에 시행되는 항목을, 그 항목이 가리키는 조문이
-        어느 공포본 소속인지('법률 제N호 … 일부개정법률 …'이면 N, 아니면 그 부칙의 공포번호)로 나눈다."""
+        """모든 부칙 중 target에 시행되는 것을, 가리키는 조문이 어느 공포본 소속인지로 나눈다.
+        - 제1조 단서 각 호: '법률/대통령령 제N호 … 일부개정법률/령 …'이면 N, 아니면 그 부칙의 공포번호
+        - 본칙 시행일이 target인 부칙: 그 공포본 전체(조문 '*')"""
         out = []
         for u in units:
+            if cls._main_effective_date(u["본문"], u.get("공포일자", ""), target):
+                sec = cls._article1_section(u["본문"])
+                out.append({"부칙": u["공포번호"], "부칙_공포일자": u.get("공포일자", ""),
+                            "소속": u["공포번호"], "조문": ["*"],
+                            "문장": re.split(r"(?<=다\.)\s", sec.strip(), maxsplit=1)[0]})
             for d, t in cls._staged_items(u["본문"]):
                 if d != target:
                     continue
-                parts = re.split(cls._AMEND_LAW_MARK, t.split(":")[0])
+                parts = re.split(cls._AMEND_LAW_MARK, cls._drop_parens(t.split(":")[0]))
                 segs = [(u["공포번호"], parts[0])]
                 for k in range(1, len(parts) - 1, 2):
                     segs.append((re.search(r"제(\d+)호", parts[k]).group(1), parts[k + 1]))
@@ -1192,7 +1245,7 @@ class LawGoKrClient:
                     if _korean_date_to_ymd(sent) == r["시행일자"] and re.search(r"제\d+조", sent):
                         todays.append(sent.strip())
                 basis = "부칙 제1조 단서 문장 (조문별 시행일)"
-            later_refs, cur = [], None
+            later_refs, cur, main_note, later_labels = [], None, "", None
             if not todays and not is_main and want:
                 lu = _latest_units()
                 cur = next((u for u in lu if u["공포번호"] == want), None)
@@ -1201,15 +1254,24 @@ class LawGoKrClient:
                     if todays:
                         basis = ("부칙 제1조 단서 각 호 — 이후 법률로 바뀐 현재 부칙 문안 "
                                  f"(최신 공포본 제{latest.get('공포번호', '')}호 원문 기준)")
+                    elif self._main_effective_date(cur["본문"], r.get("공포일자") or "", r["시행일자"]):
+                        # 본칙 시행일 자체가 바뀐 경우 (2026-11-20 실측: 소득세법 시행령 제32516호
+                        # '이 영은 2027년 1월 1일부터 시행한다. <개정 2022.12.31, 2024.12.31>')
+                        is_main, main_note = True, (
+                            f" (이후 개정으로 바뀐 현재 부칙 문안 기준, 최신 공포본 제{latest.get('공포번호', '')}호 원문)")
+                        staged = self._staged_items(cur["본문"])
                 later_refs = self._later_addenda_refs(lu, want, r["시행일자"], r.get("공포일자") or "")
-                if not todays and later_refs:
-                    todays = [ref["대상"] for ref in later_refs]
-                    basis = "후속 법률 부칙이 이 공포본 조문의 시행일을 정함"
+                if not todays and not is_main and later_refs:
+                    todays = [ref["문장"] for ref in later_refs]
+                    later_labels = []
+                    for ref in later_refs:  # 조문은 '제N호 …' 뒤쪽(이 공포본 조문 부분)에서만 뽑는다
+                        later_labels += [lb for lb in self._labels(ref["대상"]) if lb not in later_labels]
+                    basis = "후속 법령 부칙이 이 공포본 조문의 시행일을 정함"
             if later_refs:
                 v["시행일_변경_근거"] = [{k: ref[k] for k in ("공포번호", "공포일자", "문장")}
                                      for ref in later_refs]
             order = [a["조문"] for a in arts]
-            forced_labels = None
+            forced_labels = later_labels
             if not todays and not is_main and want:
                 # ③ 이 공포본이 '아직 시행 전인 개정법'을 고친 경우(타법개정 부칙의 '다른 법률의
                 #    개정'에 흔함) — 고친 조문은 그 개정법 부칙의 날짜에 시행된다.
@@ -1219,12 +1281,14 @@ class LawGoKrClient:
                 text = (cur or unit or {}).get("본문", "")
                 for link in self._amended_law_links(text, out["법령명"]):
                     hits = [it for it in items if it["소속"] == link["개정법"]
-                            and set(it["조문"]) & set(link["조문"])]
+                            and ("*" in it["조문"] or set(it["조문"]) & set(link["조문"]))]
                     if hits:
-                        common = [lb for lb in link["조문"] if any(lb in it["조문"] for it in hits)]
+                        common = [lb for lb in link["조문"]
+                                  if any("*" in it["조문"] or lb in it["조문"] for it in hits)]
                         todays = link["문장"]
                         forced_labels = common
-                        basis = (f"이 공포본 부칙이 아직 시행 전이던 법률 제{link['개정법']}호를 고침 — "
+                        ref_name = f"{link.get('종류', '')} 제{link['개정법']}호".strip()
+                        basis = (f"이 공포본 부칙이 아직 시행 전이던 {ref_name}를 고침 — "
                                  f"고친 조문은 제{link['개정법']}호의 시행일(그날)을 따른다")
                         v["연결_근거"] = [{"부칙": it["부칙"], "부칙_공포일자": it["부칙_공포일자"],
                                          "문장": it["문장"]} for it in hits]
@@ -1239,7 +1303,7 @@ class LawGoKrClient:
                     for it in items:
                         if it["소속"] == want or not (pdates.get(it["소속"], "9") < mine_date):
                             continue
-                        common = [lb for lb in it["조문"] if lb in changed]
+                        common = [lb for lb in it["조문"] if lb in changed]  # '*'는 추정에 쓰지 않음
                         if common:
                             guess.append(dict(it, 겹치는_조문=common))
                     if guess:
@@ -1270,7 +1334,7 @@ class LawGoKrClient:
                                  for m in re.finditer(r"제(\d+)조(?:의(\d+))?", t.split(":")[0])}
                 changed = [{"조문": a["조문"], "조문제목": a["조문제목"]}
                            for a in arts if a["변경"] and a["조문"] not in staged_labels]
-                v["근거"] = "본칙 시행일 — 이 공포본에서 개정 표시(<조문변경여부>Y)된 조문"
+                v["근거"] = "본칙 시행일 — 이 공포본에서 개정 표시(<조문변경여부>Y)된 조문" + main_note
                 v["개정_조문"] = changed
                 if staged:
                     v["참고"] = "부칙 단서 호에 든 조문은 각 호의 날짜에 따로 시행되므로 제외함"
