@@ -637,6 +637,9 @@ class LawGoKrClient:
         """<조약내용>을 줄 구조를 살려 텍스트로 — 조 표제를 행 첫머리에서 찾기 위해
         <p>·<br>·</div>를 줄바꿈으로 바꾼 뒤 태그를 지운다."""
         t = _strip_cdata(raw)
+        # law.go.kr 조약 본문은 줄바꿈이 \r 단독인 경우가 있다(한·미 조세조약 실측) — 정규식 ^ 가
+        # \n만 줄 경계로 보므로 먼저 \n으로 통일하지 않으면 조 표제를 하나도 찾지 못한다.
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
         t = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", t)
         t = _strip_tags(t)
         t = html.unescape(t)
@@ -880,6 +883,39 @@ class LawGoKrClient:
         return addendum_body[m.end(): m.end() + nxt.start()] if nxt else addendum_body[m.end():]
 
     @classmethod
+    def _main_effective_date(cls, addendum_body: str, promul_date: str, target: str) -> bool:
+        """부칙 제1조 본문('이 법은 …부터 시행한다. 다만, …')의 본칙 시행일이 target(YYYYMMDD)인가.
+        시행본 XML의 <시행일자>는 그 시행본의 날짜라 시행예정본에서는 늘 target과 같으므로
+        본칙 판정에 쓸 수 없다 (2026-11-20 실측: 2024년 시행된 제19563호를 2027년 본칙으로 오표시).
+        '공포한 날'·'공포 후 N일/개월/년이 경과한 날'도 처리 (경과일 계산은 ±1일 허용)."""
+        import datetime as _dt
+        sec = cls._article1_section(addendum_body)
+        main = re.split(r"다만", sec, maxsplit=1)[0]
+        ymd = _korean_date_to_ymd(main)
+        if ymd:
+            return ymd == target
+        if re.search(r"공포한\s*날", main):
+            return promul_date == target
+        m = re.search(r"공포\s*후\s*(\d+)\s*(일|개월|년)", main)
+        if m and len(promul_date) == 8 and len(target) == 8:
+            try:
+                d = _dt.date(int(promul_date[:4]), int(promul_date[4:6]), int(promul_date[6:]))
+                t = _dt.date(int(target[:4]), int(target[4:6]), int(target[6:]))
+            except ValueError:
+                return False
+            n, unit = int(m.group(1)), m.group(2)
+            if unit == "일":
+                cand = d + _dt.timedelta(days=n)
+            else:
+                months = n if unit == "개월" else n * 12
+                import calendar as _cal
+                y, mo = divmod(d.month - 1 + months, 12)
+                yy, mm = d.year + y, mo + 1
+                cand = _dt.date(yy, mm, min(d.day, _cal.monthrange(yy, mm)[1]))
+            return abs((t - cand).days) <= 3
+        return False
+
+    @classmethod
     def _staged_items(cls, addendum_body: str):
         """부칙 제1조 단서의 '각 호' 목록 → [(시행일 YYYYMMDD, 호 문장)].
         예: '2. 제17조제3항 및 제118조의9부터 …: 2027년 1월 1일' → ('20270101', '2. …')"""
@@ -943,7 +979,9 @@ class LawGoKrClient:
                 v["부칙_시행일"] = self._effective_summary(unit["본문"], limit=600)
             todays = [t for d, t in staged if d == r["시행일자"]]
             basis = "부칙 제1조 단서 각 호 (조문별 시행일)"
-            if not todays and unit and base_date != r["시행일자"]:
+            is_main = bool(unit) and self._main_effective_date(
+                unit["본문"], (r.get("공포일자") or ""), r["시행일자"])
+            if not todays and unit and not is_main:
                 # 호 목록 없이 단서 문장으로 쓴 부칙: "다만, 제x조의 개정규정은 2027년 1월 1일부터 …"
                 sec = self._article1_section(unit["본문"])
                 for sent in re.split(r"(?<=다\.)\s*|\n", sec):
@@ -972,7 +1010,7 @@ class LawGoKrClient:
                 v["근거"] = basis
                 v["이날_시행되는_개정규정"] = todays
                 v["언급_조문"] = [{"조문": lb, "조문제목": titles.get(lb, "")} for lb in labels]
-            elif base_date == r["시행일자"]:
+            elif is_main:
                 staged_labels = {(_article_label(m.group(1), m.group(2) or ""))
                                  for _d, t in staged
                                  for m in re.finditer(r"제(\d+)조(?:의(\d+))?", t.split(":")[0])}
@@ -984,8 +1022,9 @@ class LawGoKrClient:
                     v["참고"] = "부칙 단서 호에 든 조문은 각 호의 날짜에 따로 시행되므로 제외함"
             else:
                 v["근거"] = "확인 불가"
-                v["안내"] = ("이 시행일에 어떤 조문이 시행되는지 부칙 단서에서 찾지 못함 — "
-                            "law_addenda_search(promul_no=공포번호)로 부칙 전문을 확인하세요")
+                v["안내"] = ("이 시행일은 이 공포본 부칙의 본칙 시행일도, 단서 각 호의 날짜도 아님 — "
+                            "대개 이후 법률이 이 공포본 일부 조문의 시행일을 연기·변경한 경우다. "
+                            "law_addenda_search(promul_no=공포번호)와 이후 개정 부칙을 함께 확인하세요")
             versions.append(v)
         out["시행예정"] = versions
         if len(rows) > len(versions):
@@ -1015,7 +1054,9 @@ class LawGoKrClient:
             br = d["별표가지번호"].lstrip("0")
             kind = d["별표구분"] or "별표"
             body = _strip_tags(d["별표내용"])
-            body = re.sub(r"[ \t]+\n", "\n", body).strip()
+            body = body.replace("\r\n", "\n").replace("\r", "\n")
+            body = re.sub(r"[ \t]+\n", "\n", body)
+            body = re.sub(r"\n{2,}", "\n", body).strip()
             units.append({
                 "번호": f"{kind} {no}" + (f"의{br}" if br else ""),
                 "_no": no, "_br": br,
@@ -1053,10 +1094,14 @@ class LawGoKrClient:
             units = [u for u in units if kind in u["구분"]] or units
 
         if annex_no:
-            am = re.search(r"(\d+)(?:\s*의\s*(\d+))?", annex_no)
-            if not am:
-                raise LawGoKrError(f"annex_no 형식 오류: '{annex_no}' (예: '1', '1의2')")
-            no, br = am.group(1), (am.group(2) or "")
+            six = re.fullmatch(r"\s*(\d{4})(\d{2})\s*", annex_no)
+            if six:  # 횡단 검색 결과의 별표번호 형식 '000304' → 3의4
+                no, br = str(int(six.group(1))), (str(int(six.group(2))) if int(six.group(2)) else "")
+            else:
+                am = re.search(r"(\d+)(?:\s*의\s*(\d+))?", annex_no)
+                if not am:
+                    raise LawGoKrError(f"annex_no 형식 오류: '{annex_no}' (예: '1', '1의2', '000304')")
+                no, br = am.group(1).lstrip("0") or "0", (am.group(2) or "").lstrip("0")
             hits = [u for u in units if u["_no"] == no and u["_br"] == br]
             if not kind and len({u["구분"] for u in hits}) > 1:
                 pref = [u for u in hits if "별표" in u["구분"]]
@@ -1118,7 +1163,7 @@ class LawGoKrClient:
             "검색어": keyword, "검색범위": search_scope, "총건수": total_n, "page": page,
             "결과": [{
                 "별표일련번호": it.get("별표일련번호", ""),
-                "별표명": it.get("별표명", ""),
+                "별표명": _strip_tags(it.get("별표명", "")),
                 "별표번호": it.get("별표번호", ""),
                 "별표종류": it.get("별표종류", ""),
                 "관련법령명": it.get("관련법령명", ""),
