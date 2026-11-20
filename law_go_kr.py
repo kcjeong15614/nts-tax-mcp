@@ -1086,6 +1086,12 @@ class LawGoKrClient:
             lb = f"별표 {bm.group(1)}" + (f"의{bm.group(2)}" if bm.group(2) else "")
             if lb not in labels:
                 labels.append(lb)
+        # 시행규칙의 '별지 제30호의3서식', '별지 제29호의2서식(2)', '별지 제84호서식 부표 2'
+        for fm in re.finditer(r"별지\s*제(\d+)호(?:의(\d+))?서식(?:\((\d+)\))?(\s*부표(?:\s*\d+)?)?", head):
+            lb = (f"별지 제{fm.group(1)}호" + (f"의{fm.group(2)}" if fm.group(2) else "") + "서식"
+                  + (f"({fm.group(3)})" if fm.group(3) else "") + (" " + fm.group(4).strip() if fm.group(4) else ""))
+            if lb not in labels:
+                labels.append(lb)
         return labels
 
     @classmethod

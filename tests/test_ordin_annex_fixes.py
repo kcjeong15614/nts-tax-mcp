@@ -77,6 +77,13 @@ def test_annex_html_tags_still_removed():
     assert "<strong>" not in body and "대출기관 목록" in body, body
 
 
+def test_labels_include_annex_and_forms():
+    labs = L.LawGoKrClient._labels("1. 제100조제29호의3나목, 별지 제29호의2서식(2), 별표 3의3, "
+                                   "별지 제84호서식 부표 2 및 별지 제105호서식의 개정규정")
+    assert labs == ["제100조", "별표 3의3", "별지 제29호의2서식(2)", "별지 제84호서식 부표 2",
+                    "별지 제105호서식"], labs
+
+
 def test_strip_html_only_ascii_tags():
     assert L._strip_html("a<b>c</b> <개정 2020. 1. 1.> <br/>d") == "ac <개정 2020. 1. 1.> d"
     assert L._amend_note("[별표 3] <개정 2024. 2. 29., 2025. 2. 28.>") == "개정 2024. 2. 29., 2025. 2. 28."
