@@ -19,7 +19,11 @@ import requests
 # http 호출만 결과 0건이 나는 사례가 있었다 (2026-11-20, Render). 공식 가이드 URL도 https.
 BASE = os.environ.get("LAW_API_BASE", "https://www.law.go.kr/DRF")
 # 환경변수에 붙여넣을 때 앞뒤 공백·줄바꿈·따옴표가 섞이면 인증이 조용히 실패한다
-OC = os.environ.get("LAW_API_OC", "").strip().strip('"').strip("'").strip()
+_OC_RAW = os.environ.get("LAW_API_OC", "")
+# str.strip()은 제로폭 공백(U+200B)·BOM(U+FEFF)·전각 공백 등을 못 지운다. OC는 영문·숫자로만
+# 발급되므로 허용 문자만 남긴다. 걸러낸 문자는 오류 진단에 표시한다.
+OC = re.sub(r"[^A-Za-z0-9._@-]", "", _OC_RAW)
+_OC_DROPPED = sorted({f"U+{ord(c):04X}" for c in _OC_RAW if not re.match(r"[A-Za-z0-9._@-]", c)})
 TIMEOUT = 20
 
 # 같은 법령의 조문을 연속 조회하면 매번 법 전체 XML(소득세법 61만 자 등)을
@@ -85,7 +89,32 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36")
 
 
-def _check_response(endpoint: str, text: str) -> None:
+def _mask_oc(url: str) -> str:
+    return re.sub(r"(OC=)([^&]*)", lambda m: m.group(1) + (m.group(2)[:3] + "***" if m.group(2) else "(비어 있음)"), url)
+
+
+def _diag(r) -> str:
+    """오류 메시지에 붙일 진단 정보 — 실제 요청 주소(OC 가림)·리다이렉트·OC 상태."""
+    parts = []
+    try:  # 진단은 오류 보고를 돕는 부가정보 — 여기서 예외가 나 원래 오류를 가리면 안 된다
+        req = getattr(r, "request", None)
+        parts.append(f"요청주소={_mask_oc(getattr(req, 'url', '') or '(알 수 없음)')}")
+        history = getattr(r, "history", None) or []
+        if history:
+            hops = " → ".join(f"{h.status_code} {_mask_oc(h.headers.get('Location', ''))}" for h in history)
+            parts.append(f"리다이렉트={hops}; 최종주소={_mask_oc(getattr(r, 'url', ''))}")
+        else:
+            parts.append("리다이렉트=없음")
+        parts.append(f"HTTP={getattr(r, 'status_code', '?')}")
+    except Exception as e:
+        parts.append(f"요청정보 확인 실패({type(e).__name__})")
+    parts.append(f"OC길이(원본/정리후)={len(_OC_RAW)}/{len(OC)}")
+    parts.append(f"OC제거문자={','.join(_OC_DROPPED) if _OC_DROPPED else '없음'}")
+    parts.append(f"BASE={BASE}")
+    return " | ".join(parts)
+
+
+def _check_response(endpoint: str, text: str, diag: str = "") -> None:
     """정상 결과가 아닌 응답(미신청·검증 실패 안내문, HTML 오류 페이지 등)을 걸러낸다.
     이걸 놓치면 파서가 항목 0건으로 읽어 NOT_FOUND(부존재)로 보고하는 사고가 난다.
     - 목록(lawSearch.do) 정상 응답에는 0건이어도 <totalCnt>가 반드시 있다
@@ -97,11 +126,11 @@ def _check_response(endpoint: str, text: str) -> None:
     if endpoint == "lawSearch.do" and "<totalCnt>" not in text:
         raise LawGoKrAuthError(
             f"law.go.kr가 검색 결과 대신 다른 응답을 돌려줌 — OC 값·IP/도메인 등록을 확인하세요. "
-            f"응답 내용: {snippet or '(빈 응답)'}")
+            f"응답 내용: {snippet or '(빈 응답)'} [진단] {diag}")
     if endpoint == "lawService.do" and (not head.startswith("<") or looks_html):
         raise LawGoKrAuthError(
             f"law.go.kr가 본문 대신 다른 응답을 돌려줌 — OC 값·IP/도메인 등록을 확인하세요. "
-            f"응답 내용: {snippet or '(빈 응답)'}")
+            f"응답 내용: {snippet or '(빈 응답)'} [진단] {diag}")
 
 
 def _get(endpoint: str, **params) -> str:
@@ -125,8 +154,9 @@ def _get(endpoint: str, **params) -> str:
     r.raise_for_status()
     text = r.text
     if "인증" in text[:500] and "실패" in text[:500]:
-        raise LawGoKrAuthError("law.go.kr 인증 실패 — OC 또는 IP 등록 확인 필요 (open.law.go.kr에서 현재 서버 IP 등록)")
-    _check_response(endpoint, text)
+        raise LawGoKrAuthError("law.go.kr 인증 실패 — OC 또는 IP 등록 확인 필요 (open.law.go.kr에서 현재 서버 IP 등록) "
+                               f"[진단] {_diag(r)}")
+    _check_response(endpoint, text, _diag(r))
     if len(_cache) >= _CACHE_MAX:
         del _cache[min(_cache, key=lambda k: _cache[k][0])]
     _cache[key] = (now + _CACHE_TTL, text)
